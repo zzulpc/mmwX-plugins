@@ -116,7 +116,7 @@ docker build -t mmwx-speedtester:local .
 
 公开发行版发布到 `ghcr.io/zzulpc/mmwx-speedtester`。发布流程只接受
 `speedtest-vX.Y.Z` 格式的正式标签，并只生成完整版本标签与提交标签，不自动更新
-`latest`。当前源码版本为 0.2.6，以下获取方式在正式发布 `speedtest-v0.2.6` 后生效：
+`latest`。当前正式版本为 `speedtest-v0.2.6`，可通过以下方式获取：
 
 ```bash
 docker pull ghcr.io/zzulpc/mmwx-speedtester:0.2.6
@@ -175,7 +175,7 @@ go build ./...
 <details>
 <summary>更新日志</summary>
 
-### v0.2.6（待发布）
+### v0.2.6（2026-09-06）
 - **修复多线程测速系统性低估速率**：吞吐窗口和计时以前从线程起飞就开始走，代理握手、TLS
   与首字节等待全被算进速率的分母。现在与单线程走同一套窗口，只从第一个 2xx 起算。
   实测准备耗时 400ms、窗口 800ms 时低估 50%；生产参数（8 秒窗口、远端节点）低估 10~25%，
