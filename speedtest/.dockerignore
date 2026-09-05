@@ -1,0 +1,12 @@
+# Docker build 不需要这些
+.git
+.github
+*.md
+# 运行镜像需要保留第三方许可证与对应源码说明
+!THIRD_PARTY_NOTICES.md
+!CORRESPONDING_SOURCE.md
+!LICENSES/**
+data/
+scripts/
+Dockerfile
+.dockerignore

@@ -1,0 +1,199 @@
+name: SpeedTester Build and Release
+
+# 妙妙屋X 家用测速端(plugins/speedtest)独立打包。tag 形如 speedtest-v1.2.3 触发。
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'speedtest-v*'
+
+permissions:
+  contents: read
+
+env:
+  SING_BOX_SOURCE_VERSION: v1.14.0-beta.17
+  SING_BOX_SOURCE_SHA256: 061cb9769a9d117d8b100081cf721236f5b26f17d5ab6b28db8de9c76fa3a7d4
+  MIHOMO_SOURCE_VERSION: v1.19.30
+  MIHOMO_SOURCE_SHA256: ee8a7107707e4bd485460139b1944e7be30016393783f2b4e928c14880c8ca8b
+
+jobs:
+  test:
+    name: Run tests
+    uses: ./.github/workflows/ci.yml
+
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # 固定 v4
+      - name: 校验正式发布标签
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^speedtest-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "发布标签必须严格使用 speedtest-vX.Y.Z 格式"
+            exit 1
+          fi
+      - name: 校验标签与内置版本一致
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#speedtest-v}"
+          embedded_version="$(tr -d '\r\n' < speedtest/VERSION)"
+          if [[ "$tag_version" != "$embedded_version" ]]; then
+            echo "发布标签版本 ${tag_version} 与 speedtest/VERSION ${embedded_version} 不一致"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
+    needs: [validate, test]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64, ext: '' }
+          - { goos: linux, goarch: arm64, ext: '' }
+          - { goos: windows, goarch: amd64, ext: '.exe' }
+          - { goos: windows, goarch: arm64, ext: '.exe' }
+          - { goos: darwin, goarch: amd64, ext: '' }
+          - { goos: darwin, goarch: arm64, ext: '' }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # 固定 v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # 固定 v5
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: speedtest/go.sum
+      - name: Build
+        working-directory: speedtest
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p ../build
+          go build -trimpath -ldflags="-s -w" -o ../build/mmwx-speedtester-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} .
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # 固定 v4
+        with:
+          name: mmwx-speedtester-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: build/mmwx-speedtester-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          retention-days: 7
+
+  release:
+    name: Create Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/speedtest-v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # 固定 v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # 固定 v4
+        with:
+          pattern: mmwx-speedtester-*
+          path: release
+          merge-multiple: true
+      - name: 准备许可证包与代理内核对应源码
+        shell: bash
+        run: |
+          mkdir -p release/license-bundle
+          cp speedtest/THIRD_PARTY_NOTICES.md speedtest/CORRESPONDING_SOURCE.md release/license-bundle/
+          cp -R speedtest/LICENSES release/license-bundle/
+          tar -C release/license-bundle -czf release/mmwx-speedtester-licenses.tar.gz .
+          source_file="release/sing-box-${SING_BOX_SOURCE_VERSION}-source.tar.gz"
+          curl --fail --location --retry 3 \
+            --output "$source_file" \
+            "https://github.com/SagerNet/sing-box/archive/refs/tags/${SING_BOX_SOURCE_VERSION}.tar.gz"
+          echo "${SING_BOX_SOURCE_SHA256}  ${source_file}" | sha256sum --check --strict
+          source_file="release/mihomo-${MIHOMO_SOURCE_VERSION}-source.tar.gz"
+          curl --fail --location --retry 3 \
+            --output "$source_file" \
+            "https://github.com/MetaCubeX/mihomo/archive/refs/tags/${MIHOMO_SOURCE_VERSION}.tar.gz"
+          echo "${MIHOMO_SOURCE_SHA256}  ${source_file}" | sha256sum --check --strict
+      - name: Create checksums
+        shell: bash
+        run: |
+          cd release
+          find . -maxdepth 1 -type f ! -name checksums.txt -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > checksums.txt
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # 固定 v2
+        with:
+          draft: false
+          prerelease: false
+          files: |
+            release/mmwx-speedtester-*
+            release/sing-box-*-source.tar.gz
+            release/mihomo-*-source.tar.gz
+            release/checksums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker:
+    name: Build & Push Docker Image
+    needs: [validate, test, release]
+    # 正式标签必须先成功上传许可证与对应源码，才允许公开包含第三方内核的镜像；手动任务仍可只做镜像构建验证。
+    if: >-
+      always() &&
+      needs.validate.result == 'success' &&
+      needs.test.result == 'success' &&
+      (!startsWith(github.ref, 'refs/tags/speedtest-v') || needs.release.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # 推送到 ghcr.io 需要
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # 固定 v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # 固定 v3
+        # arm64 在 amd64 runner 上跨架构 build 需要 qemu
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # 固定 v3
+
+      - name: Log in to GHCR
+        # tag 推送时才登录，手动构建时跳过登录且不推送。
+        if: startsWith(github.ref, 'refs/tags/speedtest-v')
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # 固定 v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # 固定 v5
+        with:
+          # fork 后自动使用当前仓库 owner 的 GHCR 命名空间。
+          images: ghcr.io/${{ github.repository_owner }}/mmwx-speedtester
+          # metadata-action 会为版本匹配规则默认生成 latest；显式关闭，避免发布补丁版时移动浮动标签。
+          flavor: |
+            latest=false
+          tags: |
+            # 仅发布不可变的完整版本与提交标签，不自动移动 latest。
+            type=match,pattern=speedtest-v(.*),group=1
+            type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.title=mmwx-speedtester
+            org.opencontainers.image.description=支持 Snell v6 分流的妙妙屋X家庭测速端
+            org.opencontainers.image.licenses=MIT AND GPL-3.0-only AND GPL-3.0-or-later AND BSD-2-Clause AND Apache-2.0
+
+      - name: Build & push (multi-arch)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # 固定 v6
+        # Docker 构建记录不参与 Release 或部署，关闭上传可避免长期保留无用的 .dockerbuild 工件。
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: false
+        with:
+          context: ./speedtest
+          file: ./speedtest/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          # tag 触发才推,其它情况只 build 验证(免污染 GHCR + 防误 push)
+          push: ${{ startsWith(github.ref, 'refs/tags/speedtest-v') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

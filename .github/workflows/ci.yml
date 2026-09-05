@@ -1,0 +1,35 @@
+name: 持续集成
+
+on:
+  workflow_call:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: 检查 ${{ matrix.module }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - proxyparser
+          - speedtest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # 固定 v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # 固定 v5
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+      - name: 静态检查
+        working-directory: ${{ matrix.module }}
+        run: go vet ./...
+      - name: 竞争检测与测试
+        working-directory: ${{ matrix.module }}
+        run: go test ./... -race -count=1

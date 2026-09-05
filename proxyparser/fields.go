@@ -1,0 +1,48 @@
+package proxyparser
+
+import "github.com/zzulpc/mmwX-plugins/proxyparser/internal/valueutil"
+
+// skipCertVerifyAliases 是 skip-cert-verify 在各客户端/分享链接里的所有已知写法。
+var skipCertVerifyAliases = []string{
+	"insecure", "allowInsecure", "allow_insecure",
+	"skip-cert-verify", "skip_cert_verify", "skipCertVerify",
+}
+
+// certFingerprintAliases 是 Xray/v2rayN 与 Hysteria 分享格式使用的服务端证书 SHA-256 字段。
+var certFingerprintAliases = []string{
+	"pcs", "pinnedPeerCertSha256", "pinned_peer_cert_sha256",
+	"pinSHA256", "pinsha256", "tls-fingerprint",
+}
+
+// boolFromAliases 按 keys 顺序在 params 查找:任一别名存在且为真 → (true,true);
+// 存在但全为假 → (false,true);全部不存在 → (false,false)。
+func boolFromAliases(params map[string]string, keys ...string) (val bool, present bool) {
+	for _, k := range keys {
+		if v, ok := params[k]; ok {
+			present = true
+			if valueutil.Truthy(v) {
+				return true, true
+			}
+		}
+	}
+	return false, present
+}
+
+// skipCertVerify 解析 skip-cert-verify 的全部别名。
+func skipCertVerify(params map[string]string) (val bool, present bool) {
+	return boolFromAliases(params, skipCertVerifyAliases...)
+}
+
+func certFingerprint(params map[string]string) string {
+	return firstNonEmpty(params, certFingerprintAliases...)
+}
+
+// firstNonEmpty 返回 params 中按 keys 顺序第一个非空值。
+func firstNonEmpty(params map[string]string, keys ...string) string {
+	for _, k := range keys {
+		if v := params[k]; v != "" {
+			return v
+		}
+	}
+	return ""
+}

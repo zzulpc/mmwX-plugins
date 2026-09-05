@@ -1,0 +1,92 @@
+name: Promote SpeedTester Latest
+
+# latest 只在人工确认完整版本已经发布并验收后移动；正式发布工作流不会自动更新浮动标签。
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 已验收的完整版本号，例如 0.2.5
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+# 同一时间只允许一次提升操作，避免两个人把 latest 交叉移动到不同版本。
+concurrency:
+  group: speedtest-promote-latest
+  cancel-in-progress: false
+
+env:
+  IMAGE_REF: ghcr.io/${{ github.repository_owner }}/mmwx-speedtester
+
+jobs:
+  promote:
+    name: Promote ${{ inputs.version }} to latest
+    runs-on: ubuntu-latest
+    steps:
+      - name: 校验版本格式
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "版本必须严格使用 X.Y.Z 三段数字格式"
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # 固定 v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # 固定 v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 将已验收版本提升为 latest
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          source_ref="${IMAGE_REF}:${VERSION}"
+          latest_ref="${IMAGE_REF}:latest"
+          # 必须完整读取 buildx 输出；在 pipefail 下让 awk 提前退出会令上游因 SIGPIPE 返回 255。
+          source_digest="$(docker buildx imagetools inspect "$source_ref" | awk '$1 == "Digest:" && digest == "" {digest=$2} END {print digest}')"
+          if [[ ! "$source_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "无法读取源镜像 digest：${source_digest:-为空}"
+            exit 1
+          fi
+
+          # 后续只读取不可变 digest，避免版本标签在检查后、写入前被其它操作移动。
+          immutable_source="${IMAGE_REF}@${source_digest}"
+          source_manifest="$(docker buildx imagetools inspect --raw "$immutable_source")"
+          if ! jq -e '
+            (.mediaType == "application/vnd.oci.image.index.v1+json" or
+             .mediaType == "application/vnd.docker.distribution.manifest.list.v2+json") and
+            any(.manifests[]?; .platform.os == "linux" and .platform.architecture == "amd64") and
+            any(.manifests[]?; .platform.os == "linux" and .platform.architecture == "arm64")
+          ' <<< "$source_manifest" >/dev/null; then
+            echo "源镜像不是同时包含 linux/amd64 与 linux/arm64 的多架构 index"
+            exit 1
+          fi
+
+          # imagetools 只复制现有 OCI manifest，不重建任何架构镜像。
+          docker buildx imagetools create --tag "$latest_ref" "$immutable_source"
+
+          latest_digest="$(docker buildx imagetools inspect "$latest_ref" | awk '$1 == "Digest:" && digest == "" {digest=$2} END {print digest}')"
+          if [[ "$latest_digest" != "$source_digest" ]]; then
+            echo "latest digest 与源版本不一致：source=$source_digest latest=$latest_digest"
+            exit 1
+          fi
+
+          {
+            echo "### latest 已更新"
+            echo
+            echo "- 源版本：\`$source_ref\`"
+            echo "- 浮动标签：\`$latest_ref\`"
+            echo "- Manifest digest：\`$latest_digest\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,5 @@
+speedtest/speedtest
+**/data/bin/
+build/
+.DS_Store
+*.out
