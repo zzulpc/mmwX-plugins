@@ -14,6 +14,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"strings"
@@ -35,7 +36,7 @@ var versionRaw string
 var version = strings.TrimSpace(versionRaw)
 
 const (
-	// 主控 v0.4.9 会并发派发批量任务，因此容纳少量在途任务；真正测速仍由 runMu 一次执行一个，
+	// 主控 v0.4.9 会并发派发批量任务，因此容纳少量在途任务；真正测速仍由执行槽一次执行一个，
 	// 超出四个才回报忙，既兼容常见小批量，也避免无界等待。
 	runConcurrency = 4
 	// 单次 probe 最多拨测多少个目标 —— 防止主控(或被攻破的主控)拿家用测速端当端口扫描器。
@@ -57,8 +58,8 @@ const (
 	// 单轮最多逐条打印多少个不可达目标。整批全挂(断网、上游拒绝)时不该刷几百行。
 	probeLogFailLimit = 20
 
-	// runQueueWaitBudget 任务排队等待 runMu 的上限。执行预算(runExecutionBudget)只在拿到
-	// runMu 之后才起算,两者相加才是一个 run 任务从收包到必须有结论的总时长。
+	// runQueueWaitBudget 是取得执行权之前的等待上限。执行预算(runExecutionBudget)只在
+	// 取得执行权之后才起算，两段均继承连接取消，但执行时钟不继承排队期限。
 	// 排队超过这个数说明测速端是真的忙,回一条失败让主控稍后重试,比让它干等更有用。
 	runQueueWaitBudget = 60 * time.Second
 
@@ -357,23 +358,24 @@ func connectAndServeWithIPv6Check(wsURL, name string, onConnected func(), ipv6Ch
 // dispatchRunJob 从收到消息时就启动超时，并继承连接取消；断线后的结果无法回传，
 // 不应让旧任务继续占用带宽。非阻塞信号量仍拒绝超出容量的任务。
 //
-// 总预算 = 排队等待 + 执行,不能像以前那样只给一份 38s:38s 既装不下单个任务各阶段超时之和
-// (见 runExecutionBudget),也没给 runMu 前面那三个在途任务留任何排队时间。
+// 排队和执行分别限制时长，不能只给一个总期限，否则晚开始的任务仍会被挤压执行时间。
 func dispatchRunJob(parentCtx context.Context, job wsMsg, send func(wsMsg) error) {
-	ctx, cancel := context.WithTimeout(parentCtx, runQueueWaitBudget+runExecutionBudget)
-	if ctx.Err() != nil {
-		cancel()
+	dispatchRunJobWithBudgets(parentCtx, job, send, runQueueWaitBudget, runExecutionBudget)
+}
+
+// 独立入口允许测试缩短两段预算，验证排队超时和槽位释放，无须等待生产级超时。
+func dispatchRunJobWithBudgets(parentCtx context.Context, job wsMsg, send func(wsMsg) error, queueBudget, executionBudget time.Duration) {
+	queueDeadline := time.Now().Add(queueBudget)
+	if parentCtx.Err() != nil {
 		return
 	}
 	select {
 	case runJobSlots <- struct{}{}:
 		go func() {
-			defer cancel()
 			defer func() { <-runJobSlots }()
-			runJob(ctx, job, send)
+			runJobWithDeadline(parentCtx, job, send, queueDeadline, executionBudget)
 		}()
 	default:
-		cancel()
 		log.Printf("[speedtester] 拒绝测速任务 job=%s: 测速端忙", job.JobID)
 		if err := send(wsMsg{Type: "result", JobID: job.JobID, Status: "failed", Error: "测速端忙"}); err != nil {
 			log.Printf("[speedtester] 回传忙状态失败: %v", err)
@@ -409,24 +411,11 @@ func dispatchProbeJobWithBudget(parentCtx context.Context, job wsMsg, send func(
 }
 
 func runJob(ctx context.Context, job wsMsg, send func(wsMsg) error) {
-	effectiveBuf, effectiveThreads := clampSpeedTestParams(int(job.BufSize), job.Threads)
-	log.Printf(
-		"[speedtester] 收到测速任务 job=%s threads=%d buf=%d bytes=%d latency_only=%t",
-		job.JobID, effectiveThreads, effectiveBuf, job.Bytes, job.LatencyOnly,
-	)
-	runtimeInfo, err := resolveProxyRuntime(ctx, job.ClashConfig)
-	if err != nil {
-		_ = send(wsMsg{Type: "result", JobID: job.JobID, Status: "failed", Error: err.Error()})
-		return
-	}
-	log.Printf("[speedtester] job=%s 使用内核=%s", job.JobID, runtimeInfo.Core)
-	res, terr := RunNodeTest(ctx, runtimeInfo, job.ClashConfig, Options{
-		TestBytes:   job.Bytes,
-		TestURL:     job.URL,
-		Threads:     job.Threads,
-		BufSize:     int(job.BufSize),
-		LatencyOnly: job.LatencyOnly,
-	})
+	runJobWithDeadline(ctx, job, send, time.Now().Add(runQueueWaitBudget), runExecutionBudget)
+}
+
+func runJobWithDeadline(ctx context.Context, job wsMsg, send func(wsMsg) error, queueDeadline time.Time, executionBudget time.Duration) {
+	res, terr := executeRunJob(ctx, job, queueDeadline, executionBudget)
 	out := wsMsg{Type: "result", JobID: job.JobID, LatencyMs: res.LatencyMs, EgressIP: res.EgressIP}
 	if terr != nil {
 		out.Status = "failed"
@@ -441,6 +430,32 @@ func runJob(ctx context.Context, job wsMsg, send func(wsMsg) error) {
 		return
 	}
 	log.Printf("[speedtester] job=%s 完成 status=%s down=%.1fMbps", job.JobID, out.Status, out.DownMbps)
+}
+
+// 先结束测速并释放执行权，再由调用方回包，避免主控写入阻塞继续占住串行执行槽。
+func executeRunJob(ctx context.Context, job wsMsg, queueDeadline time.Time, executionBudget time.Duration) (Result, error) {
+	executionCtx, finish, err := beginRun(ctx, queueDeadline, executionBudget)
+	if err != nil {
+		return Result{}, err
+	}
+	defer finish()
+	effectiveBuf, effectiveThreads := clampSpeedTestParams(int(job.BufSize), job.Threads)
+	log.Printf(
+		"[speedtester] 收到测速任务 job=%s threads=%d buf=%d bytes=%d latency_only=%t",
+		job.JobID, effectiveThreads, effectiveBuf, job.Bytes, job.LatencyOnly,
+	)
+	runtimeInfo, err := resolveProxyRuntime(executionCtx, job.ClashConfig)
+	if err != nil {
+		return Result{}, err
+	}
+	log.Printf("[speedtester] job=%s 使用内核=%s", job.JobID, runtimeInfo.Core)
+	return runNodeTest(executionCtx, runtimeInfo, job.ClashConfig, Options{
+		TestBytes:   job.Bytes,
+		TestURL:     job.URL,
+		Threads:     job.Threads,
+		BufSize:     int(job.BufSize),
+		LatencyOnly: job.LatencyOnly,
+	})
 }
 
 // buildWSURL 把 http(s) 主控地址转成 ws(s) 的测速端连接 URL。
@@ -635,7 +650,7 @@ func runProbeWithDial(
 // 得自己补 —— 家用宽带落在 CGNAT 里的很常见,不补等于没拦。
 func probeTargetAllowed(ip net.IP) bool {
 	if ip == nil {
-		return true // 解析不出 IP 就交给拨号器自己报错,不在这里编造结论
+		return false // 无法确认即将连接的地址时不能放行。
 	}
 	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsPrivate() ||
 		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
@@ -656,7 +671,16 @@ func probeTargetAllowed(ip net.IP) bool {
 // probeAllowsPrivateTargets 每次拨号都读一次环境变量:值本身来自进程启动环境的缓存,
 // 这个读取几乎不花钱,但能让运维改完变量重启即生效,也让测试能逐用例切换。
 func probeAllowsPrivateTargets() bool {
-	return strings.TrimSpace(os.Getenv(probeAllowPrivateEnv)) != ""
+	return strings.TrimSpace(os.Getenv(probeAllowPrivateEnv)) == "1"
+}
+
+// Control 收到的是解析后的地址。使用支持 IPv6 接口标识的解析器，防止 %zone 让 IP 解析失败后绕过限制。
+func controlProbeTarget(_ string, address string, _ syscall.RawConn) error {
+	endpoint, err := netip.ParseAddrPort(address)
+	if err != nil || !probeTargetAllowed(net.IP(endpoint.Addr().AsSlice())) {
+		return errProbeTargetNotPublic
+	}
+	return nil
 }
 
 // dialProbe 拨一个 host:port,返回是否可达与握手耗时。
@@ -669,16 +693,7 @@ func dialProbe(ctx context.Context, target string, timeout time.Duration) probeR
 	start := time.Now()
 	dialer := net.Dialer{Timeout: timeout}
 	if !probeAllowsPrivateTargets() {
-		dialer.Control = func(_, address string, _ syscall.RawConn) error {
-			host, _, err := net.SplitHostPort(address)
-			if err != nil {
-				return nil
-			}
-			if !probeTargetAllowed(net.ParseIP(host)) {
-				return errProbeTargetNotPublic
-			}
-			return nil
-		}
+		dialer.Control = controlProbeTarget
 	}
 	conn, err := dialer.DialContext(ctx, "tcp", target)
 	if err != nil {

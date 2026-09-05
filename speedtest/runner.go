@@ -44,18 +44,39 @@ const (
 	downloadSetupTime      = 10 * time.Second // 首个 2xx 的独立准备预算,不挤占吞吐窗口
 	runPhaseMargin         = 5 * time.Second  // 进程启停、临时目录、调度等零碎开销
 
-	// latencyProbeBodyLimit:204 端点本该零字节,这里只是把"万一不是它"的读取封住。
-	latencyProbeBodyLimit = 4 << 10
-
-	// runExecutionBudget 只从任务拿到 runMu 之后开始走,不含排队等待 —— 排队预算见 main.go
+	// runExecutionBudget 只从任务取得执行权之后开始走,不含排队等待 —— 排队预算见 main.go
 	// 的 runQueueWaitBudget。两者以前混在一起,4 个在途任务共用同一个 38s 时钟,
 	// 排在后面的任务会被前面的执行时间吃光预算。
 	runExecutionBudget = coreReadyTimeout + singBoxCheckTimeout + egressProbeTimeout +
 		latencyProbeTimeout + downloadSetupTime + defaultTestDuration + runPhaseMargin
 )
 
-// runMu 串行化测速:一次只跑一个节点,避免并发抢带宽导致结果失真。
-var runMu sync.Mutex
+// runExecutionSlot 串行化测速，同时允许排队任务因超时或断线立即退出。
+var runExecutionSlot = make(chan struct{}, 1)
+
+// beginRun 先等待执行权，再从父上下文派生独立的执行时钟；排队期限不能成为执行期限的父级。
+func beginRun(ctx context.Context, queueDeadline time.Time, executionBudget time.Duration) (context.Context, func(), error) {
+	queueCtx, cancelQueue := context.WithDeadline(ctx, queueDeadline)
+	defer cancelQueue()
+	select {
+	case runExecutionSlot <- struct{}{}:
+		// 取消与空闲槽同时就绪时，select 可能选中槽位，仍须拒绝已过期的任务。
+		if err := queueCtx.Err(); err != nil {
+			<-runExecutionSlot
+			return nil, nil, fmt.Errorf("测速任务等待执行超时: %w", err)
+		}
+	case <-queueCtx.Done():
+		return nil, nil, fmt.Errorf("测速任务等待执行超时: %w", queueCtx.Err())
+	}
+	if executionBudget <= 0 {
+		executionBudget = runExecutionBudget
+	}
+	executionCtx, cancelExecution := context.WithTimeout(ctx, executionBudget)
+	return executionCtx, func() {
+		cancelExecution()
+		<-runExecutionSlot
+	}, nil
+}
 
 // Result 单节点测速结果。
 type Result struct {
@@ -127,24 +148,19 @@ func clampSpeedTestParams(bufSize, threads int) (int, int) {
 
 // RunNodeTest 用已选择的代理内核启动单节点代理，并测量延迟、出口 IP 与下行吞吐。
 func RunNodeTest(ctx context.Context, runtimeInfo proxyRuntime, clashConfigJSON string, opts Options) (Result, error) {
+	executionCtx, finish, err := beginRun(ctx, time.Now().Add(runQueueWaitBudget), opts.Timeout)
+	if err != nil {
+		return Result{}, err
+	}
+	defer finish()
+	return runNodeTest(executionCtx, runtimeInfo, clashConfigJSON, opts)
+}
+
+// runNodeTest 只供已取得执行权的入口调用，主控任务的内核准备与测速共用一份执行预算。
+func runNodeTest(ctx context.Context, runtimeInfo proxyRuntime, clashConfigJSON string, opts Options) (Result, error) {
 	if opts.TestDuration <= 0 {
 		opts.TestDuration = defaultTestDuration
 	}
-	if opts.Timeout <= 0 {
-		opts.Timeout = runExecutionBudget
-	}
-
-	// 执行预算必须等拿到 runMu 之后再起算。以前是在排队之前就 WithTimeout:runConcurrency=4
-	// 允许 4 个在途任务,但真正测速是 runMu 串行的,四个任务共用各自那个 38s 时钟 ——
-	// 排第 3、第 4 位的任务光排队就耗光预算,以「等待执行超时」失败,主控看着像节点坏了。
-	// 排队本身的上限由调用方(dispatchRunJob 的 runQueueWaitBudget)通过父 ctx 施加。
-	runMu.Lock()
-	defer runMu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return Result{}, fmt.Errorf("测速任务等待执行超时: %w", err)
-	}
-	ctx, cancel := context.WithTimeout(ctx, opts.Timeout)
-	defer cancel()
 
 	testURL := opts.TestURL
 	if testURL == "" {
@@ -365,13 +381,24 @@ func putCopyBuf(b *[]byte) { copyBufPool.Put(b) }
 
 // measureLatency 经代理 GET 一个 204 端点,返回毫秒;失败返回 -1。
 //
-// 必须看状态码:落地门户、上游错误页也会很快回 200,只认"没报错"就会把一个又快又假的
-// 延迟当成真结果。响应体同时限长 —— 204 端点本该是空的,回来一大坨就说明这不是它。
+// 固定端点只认 204；登录页或错误页即使返回 200，也不能作为有效延迟。
 func measureLatency(ctx context.Context, mixedPort int) int64 {
-	client := proxyClient(mixedPort)
+	client := latencyProbeClient(mixedPort, latencyProbeTimeout)
 	defer client.CloseIdleConnections()
-	client.Timeout = latencyProbeTimeout
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, latencyProbeURL, nil)
+	return measureLatencySample(ctx, client, latencyProbeURL)
+}
+
+// 固定探测端点不应跳转；跟随登录页后再收到 204 也不能证明原端点正常。
+func latencyProbeClient(mixedPort int, timeout time.Duration) *http.Client {
+	client := proxyClient(mixedPort)
+	client.Timeout = timeout
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return client
+}
+
+// 两种延迟模式共用相同的响应校验，避免多采样路径重新接受错误页。
+func measureLatencySample(ctx context.Context, client *http.Client, probeURL string) int64 {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
 	if err != nil {
 		return -1
 	}
@@ -380,9 +407,13 @@ func measureLatency(ctx context.Context, mixedPort int) int64 {
 	if err != nil {
 		return -1
 	}
-	io.Copy(io.Discard, io.LimitReader(resp.Body, latencyProbeBodyLimit))
-	resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return -1
+	}
+	// 正常 204 没有响应体；只读一个字节即可拒绝异常内容，并保留读取失败和取消。
+	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, 1))
+	if err != nil || n != 0 || ctx.Err() != nil {
 		return -1
 	}
 	return time.Since(start).Milliseconds()
@@ -393,36 +424,28 @@ func measureLatency(ctx context.Context, mixedPort int) int64 {
 //
 // 整个采样阶段另有 cfLatencyTotalTimeout 兜底:单次超时 × 采样数会突破 runExecutionBudget
 // 里为这一阶段留的份额,而 LatencyOnly 任务后面还要靠这个预算收尾。
-// 非 2xx 的样本直接丢弃(理由同 measureLatency),一个都没有就返回 -1,由调用方回报失败。
+// 非 204 的样本直接丢弃，一个都没有就返回 -1，由调用方回报失败。
 func measureLatencyCloudflare(ctx context.Context, mixedPort, samples int) int64 {
 	if samples <= 0 {
 		samples = cfLatencySamples
 	}
 	phaseCtx, cancelPhase := context.WithTimeout(ctx, cfLatencyTotalTimeout)
 	defer cancelPhase()
-	client := proxyClient(mixedPort)
+	client := latencyProbeClient(mixedPort, cfLatencySampleTimeout)
 	defer client.CloseIdleConnections()
-	client.Timeout = cfLatencySampleTimeout
+	return measureLatencySamples(phaseCtx, client, cfLatencyProbeURL, samples)
+}
+
+// 汇总时只保留通过同一端点校验的样本；无有效样本仍须向调用方返回失败。
+func measureLatencySamples(ctx context.Context, client *http.Client, probeURL string, samples int) int64 {
 	probes := make([]int64, 0, samples)
 	for i := 0; i < samples; i++ {
-		if phaseCtx.Err() != nil {
+		if ctx.Err() != nil {
 			break
 		}
-		req, err := http.NewRequestWithContext(phaseCtx, http.MethodGet, cfLatencyProbeURL, nil)
-		if err != nil {
-			continue
+		if latency := measureLatencySample(ctx, client, probeURL); latency >= 0 {
+			probes = append(probes, latency)
 		}
-		start := time.Now()
-		resp, err := client.Do(req)
-		if err != nil {
-			continue
-		}
-		io.Copy(io.Discard, io.LimitReader(resp.Body, latencyProbeBodyLimit))
-		resp.Body.Close()
-		if resp.StatusCode/100 != 2 {
-			continue
-		}
-		probes = append(probes, time.Since(start).Milliseconds())
 	}
 	if len(probes) == 0 {
 		return -1

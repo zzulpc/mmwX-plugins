@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -383,6 +385,7 @@ func waitForSlotCount(t *testing.T, slots chan struct{}, want int, timeout time.
 // probe 是纯 TCP 拨测,单条消息 200 个目标、8 个在途任务。不限地址的话,主控(或被攻破的
 // 主控)拿它就能扫遍家庭内网 —— 「不当端口扫描器」这条约束原来只限了数量,没限地址。
 func TestDialProbe默认拒绝内网与保留地址(t *testing.T) {
+	t.Setenv(probeAllowPrivateEnv, "")
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("创建测试监听失败: %v", err)
@@ -397,21 +400,6 @@ func TestDialProbe默认拒绝内网与保留地址(t *testing.T) {
 	if !strings.Contains(result.Error, probeAllowPrivateEnv) {
 		t.Fatalf("拒绝原因应指明放开方式，实际为 %q", result.Error)
 	}
-
-	for _, target := range []string{
-		"10.0.0.1:80", "172.16.0.1:80", "192.168.1.1:80",
-		"169.254.1.1:80", "100.64.0.1:80", "240.0.0.1:80",
-		"[::1]:80", "[fc00::1]:80", "[fe80::1]:80",
-	} {
-		if got := dialProbe(context.Background(), target, 200*time.Millisecond); got.OK {
-			t.Fatalf("内网/保留地址 %s 不应判定为通: %#v", target, got)
-		}
-	}
-
-	// 公网地址不受影响:这里只校验没有被 Control 提前拦掉，连通与否交给网络环境。
-	if got := dialProbe(context.Background(), "203.0.113.1:80", 50*time.Millisecond); strings.Contains(got.Error, probeAllowPrivateEnv) {
-		t.Fatalf("公网地址被误拦: %#v", got)
-	}
 }
 
 func TestProbeTargetAllowed(t *testing.T) {
@@ -425,14 +413,82 @@ func TestProbeTargetAllowed(t *testing.T) {
 			t.Fatalf("%s 应被判定为内网/保留地址", raw)
 		}
 	}
-	allowed := []string{"1.1.1.1", "8.8.8.8", "203.0.113.1", "100.63.255.255", "100.128.0.1", "2606:4700:4700::1111"}
+	allowed := []string{"1.1.1.1", "8.8.8.8", "100.63.255.255", "100.128.0.1", "2606:4700:4700::1111"}
 	for _, raw := range allowed {
 		if !probeTargetAllowed(net.ParseIP(raw)) {
 			t.Fatalf("%s 应被判定为公网地址", raw)
 		}
 	}
-	// 解析不出 IP 时不在这里编造结论，交给拨号器报真实的解析错误。
-	if !probeTargetAllowed(nil) {
-		t.Fatal("无法解析的地址不应在 Control 里被拦下")
+	if probeTargetAllowed(nil) {
+		t.Fatal("无法确认的地址必须拒绝")
+	}
+}
+
+// 直接验证拨号前的同一个检查函数，公网、私网和异常输入均不产生真实网络连接。
+func TestControlProbeTarget地址限制(t *testing.T) {
+	for _, target := range []string{
+		"127.0.0.1:80", "10.0.0.1:80", "172.16.0.1:80", "192.168.1.1:80",
+		"169.254.1.1:80", "100.64.0.1:80", "240.0.0.1:80", "[::1]:80",
+		"[::1%lo0]:80", "[::1%1]:80", "[fc00::1%eth0]:80", "[fe80::1%eth0]:80",
+		"[::ffff:127.0.0.1]:80", "[::ffff:192.168.1.1%1]:80",
+		"", "example.invalid:80", "[::1]", "127.0.0.1:invalid",
+	} {
+		if err := controlProbeTarget("tcp", target, nil); !errors.Is(err, errProbeTargetNotPublic) {
+			t.Errorf("%s 应在拨号前被拒绝，实际为 %v", target, err)
+		}
+	}
+	for _, target := range []string{"1.1.1.1:80", "[2606:4700:4700::1111]:443"} {
+		if err := controlProbeTarget("tcp", target, nil); err != nil {
+			t.Errorf("公网地址 %s 被误拦: %v", target, err)
+		}
+	}
+}
+
+func TestDialProbe带接口标识的IPv6仍拒绝回环(t *testing.T) {
+	t.Setenv(probeAllowPrivateEnv, "")
+	listener, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("本机没有可用的 IPv6 回环: %v", err)
+	}
+	defer listener.Close()
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagLoopback == 0 {
+			continue
+		}
+		for _, zone := range []string{iface.Name, strconv.Itoa(iface.Index)} {
+			target := net.JoinHostPort("::1%"+zone, port)
+			got := dialProbe(context.Background(), target, time.Second)
+			if got.OK || !strings.Contains(got.Error, probeAllowPrivateEnv) {
+				t.Errorf("带接口标识的回环目标未被策略拦截: %#v", got)
+			}
+		}
+		return
+	}
+	t.Skip("本机未列出回环接口，地址解析仍由纯函数用例覆盖")
+}
+
+func TestDialProbe只有显式一才放开内网(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	for _, value := range []string{"", "0", "false", "true", "yes", "invalid", "1", " 1 "} {
+		t.Run(fmt.Sprintf("值=%q", value), func(t *testing.T) {
+			t.Setenv(probeAllowPrivateEnv, value)
+			got := dialProbe(context.Background(), listener.Addr().String(), time.Second)
+			wantAllowed := strings.TrimSpace(value) == "1"
+			if got.OK != wantAllowed {
+				t.Fatalf("开关值 %q 的拨号结果不符: %#v", value, got)
+			}
+			if !wantAllowed && !strings.Contains(got.Error, probeAllowPrivateEnv) {
+				t.Fatalf("应由策略拒绝，而非连接失败: %#v", got)
+			}
+		})
 	}
 }

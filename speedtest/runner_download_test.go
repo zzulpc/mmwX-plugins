@@ -17,21 +17,22 @@ import (
 	"time"
 )
 
-func TestRunNodeTest等待锁计入超时(t *testing.T) {
+func TestRunNodeTest排队超时不等待执行权释放(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	runMu.Lock()
+	occupyRunExecution(t)
 	done := make(chan error, 1)
 	go func() {
 		_, err := RunNodeTest(ctx, proxyRuntime{}, `{}`, Options{Timeout: time.Second})
 		done <- err
 	}()
-	<-ctx.Done()
-	runMu.Unlock()
-
-	err := <-done
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("等待锁超时应返回 context deadline exceeded，实际为 %v", err)
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("排队超时应返回 context deadline exceeded，实际为 %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("父任务超时后仍在等待执行权")
 	}
 }
 

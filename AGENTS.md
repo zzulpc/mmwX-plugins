@@ -37,8 +37,8 @@ cd speedtest && go build ./... && go vet ./... && go test ./... -count=1
 
 基线（2026-09-05，Go 1.26.8，与发布工具链一致）：两者都干净通过，`go vet` 无告警。
 覆盖率（`go test ./... -cover -count=1`）：`proxyparser` 44.5%、
-`proxyparser/internal/valueutil` 74.2%、`proxyparser/substore` 40.5%、`speedtest` 69.0~69.1%
-（`speedtest` 有几条用例依赖本机是否装了 sing-box，会在这个区间内小幅浮动）。
+`proxyparser/internal/valueutil` 74.2%、`proxyparser/substore` 40.5%、`speedtest` 70.6%
+（本次未启用可选的已安装 sing-box 校验；启用这些用例时应单独记录覆盖率）。
 请在同一 Go 工具链下比较覆盖率，不要直接与旧 Go 1.27.0 基线混用；跨包往返测试
 位于 `proxyparser/roundtrip`，其调用默认不计入被调用包的覆盖率。
 **改完测试顺手把这几个数对一遍**，基线错了会让人误以为新加的测试没生效。
@@ -80,7 +80,7 @@ CDN 回源 Host 头被静默丢掉；对应双入口回归测试在 `proxyparser
 | 不变量 | 在哪 | 钉它的用例 |
 |---|---|---|
 | 吞吐速率的分母不含响应准备时间 | `downloadWindow`，单/多线程共用；计时只从第一个 2xx 起算 | `TestDownloadTimed单线程响应准备不占用吞吐窗口`、`TestDownloadTimed多线程响应准备不占用吞吐窗口` |
-| 各阶段超时之和装得进执行预算 | `runExecutionBudget`（`runner.go`）；排队预算是另一段，见 `runQueueWaitBudget`（`main.go`） | `TestRun执行预算能装下所有阶段超时` |
+| 各阶段超时之和装得进执行预算，排队不挤压执行时间 | `runExecutionBudget` / `beginRun`（`runner.go`）；独立排队预算见 `runQueueWaitBudget`（`main.go`） | `TestRun执行预算能装下所有阶段超时`、`TestDispatchRunJob排队超时释放任务槽`、`TestBeginRun排队不消耗执行预算` |
 | 生成配置里的节点名与主控下发的名字解耦 | `mihomoNodeTag` / `mihomoGroupTag` | `TestBuildMihomoConfig固定内部节点名` |
 
 具体踩过的坑：
