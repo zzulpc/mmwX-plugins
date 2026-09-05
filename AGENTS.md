@@ -37,7 +37,8 @@ cd speedtest && go build ./... && go vet ./... && go test ./... -count=1
 
 基线（2026-09-05，Go 1.26.8，与发布工具链一致）：两者都干净通过，`go vet` 无告警。
 覆盖率（`go test ./... -cover -count=1`）：`proxyparser` 44.5%、
-`proxyparser/internal/valueutil` 74.2%、`proxyparser/substore` 40.5%、`speedtest` 67.3%。
+`proxyparser/internal/valueutil` 74.2%、`proxyparser/substore` 40.5%、`speedtest` 69.0~69.1%
+（`speedtest` 有几条用例依赖本机是否装了 sing-box，会在这个区间内小幅浮动）。
 请在同一 Go 工具链下比较覆盖率，不要直接与旧 Go 1.27.0 基线混用；跨包往返测试
 位于 `proxyparser/roundtrip`，其调用默认不计入被调用包的覆盖率。
 **改完测试顺手把这几个数对一遍**，基线错了会让人误以为新加的测试没生效。
@@ -55,7 +56,7 @@ cd speedtest && go build ./... && go vet ./... && go test ./... -count=1
   的对照标记，改动时保留这些标记。
 - 不要顺手格式化整个文件、不要重构任务范围外的代码、不要动 `go.mod` 的依赖版本。
 
-## 两个容易踩的地方
+## 三个容易踩的地方
 
 **1. `proxyparser` 有两条数据入口，类型不一样**
 
@@ -71,6 +72,26 @@ CDN 回源 Host 头被静默丢掉；对应双入口回归测试在 `proxyparser
 
 `proxyparser.Parse()`（URI → map）和 `substore.URIProducer`（map → URI）
 分别在根包和子包，两边各自的单测都绿不代表往返是对的。改任一侧时想一下另一侧。
+
+**3. `speedtest` 有三条必须一起维护的不变量**
+
+这三条都出过 bug，而且都属于「单看改动没问题、放进整体就错」的类型，各自有专门的用例钉着：
+
+| 不变量 | 在哪 | 钉它的用例 |
+|---|---|---|
+| 吞吐速率的分母不含响应准备时间 | `downloadWindow`，单/多线程共用；计时只从第一个 2xx 起算 | `TestDownloadTimed单线程响应准备不占用吞吐窗口`、`TestDownloadTimed多线程响应准备不占用吞吐窗口` |
+| 各阶段超时之和装得进执行预算 | `runExecutionBudget`（`runner.go`）；排队预算是另一段，见 `runQueueWaitBudget`（`main.go`） | `TestRun执行预算能装下所有阶段超时` |
+| 生成配置里的节点名与主控下发的名字解耦 | `mihomoNodeTag` / `mihomoGroupTag` | `TestBuildMihomoConfig固定内部节点名` |
+
+具体踩过的坑：
+
+- **多线程测速曾系统性低估速率。** 单线程 v0.2.3 就把 setup 从计时里摘出去了，多线程当时漏掉，
+  一直到 v0.2.6 才修。改动下载相关代码时，先确认自己没有把「协程起飞」当成「开始计时」。
+- **加一个新阶段（或调大某个阶段的超时）必须同步 `runExecutionBudget`。**
+  预算不闭合的表现不是超时，而是最后一个阶段报出「剩余时间不足以完成 8s 吞吐测试」，
+  看起来像节点故障。
+- **节点名来自订阅，是用户可控的。** 直接写进 mihomo 配置会撞上 DIRECT / REJECT / GLOBAL
+  这些预置名，mihomo 以「名字重复」拒绝加载，用户只看得到「内核在端口就绪前退出」。
 
 ## 发布
 

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -373,7 +374,39 @@ func TestDownloadTimed单线程三次响应体均断流仍失败(t *testing.T) {
 	}
 }
 
-func TestDownloadTimed父任务超时不能按测速截止成功(t *testing.T) {
+// 多线程改用 downloadWindow 之后，「父任务剩余时间装不下一个完整吞吐窗口」在开跑之前
+// 就会被挡下 —— 与其跑一段注定被腰斩的测速再把它算成速率，不如一个请求都不发。
+func TestDownloadTimed多线程剩余时间不足以完成窗口时不开跑(t *testing.T) {
+	var attempts atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer proxy.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel()
+	port := testServerPort(t, proxy.URL)
+	got, _, err := downloadTimed(ctx, "http://download.example/test.bin", time.Second, 0, 8, minBufSize, port)
+	if err == nil {
+		t.Fatal("剩余时间不足时必须失败")
+	}
+	if !strings.Contains(err.Error(), "剩余时间不足") {
+		t.Fatalf("失败原因应说明剩余时间不足，实际为 %v", err)
+	}
+	if got != 0 {
+		t.Fatalf("未开跑却回报了 %d 字节", got)
+	}
+	if attempts.Load() != 0 {
+		t.Fatalf("剩余时间不足时不应发出任何请求，实际 %d 次", attempts.Load())
+	}
+}
+
+// 主控断线会取消整条连接派发的任务(见 dispatchRunJob)。测速跑到一半被取消时，
+// 已经收到的字节不能拿来凑一个「成功」的速率 —— 这是原来那个父任务超时用例真正在守的东西，
+// 换成取消是因为超时那条路径现在被上面的 fail fast 提前挡住了。
+func TestDownloadTimed多线程父任务取消不能按部分字节成功(t *testing.T) {
+	streaming := make(chan struct{}, 64)
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		flusher, ok := w.(http.Flusher)
@@ -383,6 +416,7 @@ func TestDownloadTimed父任务超时不能按测速截止成功(t *testing.T) {
 		}
 		flusher.Flush()
 		chunk := make([]byte, 4<<10)
+		first := true
 		for {
 			select {
 			case <-r.Context().Done():
@@ -392,39 +426,79 @@ func TestDownloadTimed父任务超时不能按测速截止成功(t *testing.T) {
 					return
 				}
 				flusher.Flush()
+				if first {
+					first = false
+					streaming <- struct{}{}
+				}
 				time.Sleep(time.Millisecond)
 			}
 		}
 	}))
 	defer proxy.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	port := testServerPort(t, proxy.URL)
-	_, _, err := downloadTimed(ctx, "http://download.example/test.bin", time.Second, 0, 8, minBufSize, port)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("父任务超时必须失败，实际为 %v", err)
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := downloadTimed(ctx, "http://download.example/test.bin", 30*time.Second, 0, 8, minBufSize, port)
+		done <- err
+	}()
+	select {
+	case <-streaming:
+	case <-time.After(5 * time.Second):
+		t.Fatal("多线程下载未开始收字节")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("父任务取消必须失败，实际为 %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("父任务取消后下载未收尾")
 	}
 }
 
-func TestDownloadTimed部分流完成后父任务超时仍失败(t *testing.T) {
+// 一条流已经正常读完时更容易被误判成成功:必须确认取消仍然压过它。
+func TestDownloadTimed部分流完成后父任务取消仍失败(t *testing.T) {
 	var attempts atomic.Int32
+	allStarted := make(chan struct{})
+	var startedOnce sync.Once
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if attempts.Add(1) == 1 {
 			w.Header().Set("Content-Length", "4096")
 			_, _ = io.CopyN(w, zeroReader{}, 4096)
 			return
 		}
+		if attempts.Load() >= 8 {
+			startedOnce.Do(func() { close(allStarted) })
+		}
 		<-r.Context().Done()
 	}))
 	defer proxy.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	port := testServerPort(t, proxy.URL)
-	_, _, err := downloadTimed(ctx, "http://download.example/test.bin", time.Second, 0, 8, minBufSize, port)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("已有一条流完成时父任务超时仍必须失败，实际为 %v", err)
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := downloadTimed(ctx, "http://download.example/test.bin", 30*time.Second, 0, 8, minBufSize, port)
+		done <- err
+	}()
+	select {
+	case <-allStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("8 条流未全部启动，实际 %d 次", attempts.Load())
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("已有一条流完成时父任务取消仍必须失败，实际为 %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("父任务取消后下载未收尾")
 	}
 	if attempts.Load() != 8 {
 		t.Fatalf("请求次数为 %d，期望 8 条流全部启动", attempts.Load())
@@ -513,4 +587,73 @@ func (zeroReader) Read(p []byte) (int, error) {
 		p[i] = 0
 	}
 	return len(p), nil
+}
+
+// 多线程测速的头号历史 bug:窗口和计时都从协程起飞就开始走，代理握手 + TLS + TTFB 全被算进
+// 速率的分母，而字节要等 2xx 之后才进账。setup 400ms / 窗口 800ms 时实测低估 50%,
+// 生产参数(8s 窗口、远端节点)低估 10~25%，延迟越高压得越狠。
+// 单线程路径 v0.2.3 就修过同一个问题(见 TestDownloadTimed单线程响应准备不占用吞吐窗口)。
+func TestDownloadTimed多线程响应准备不占用吞吐窗口(t *testing.T) {
+	const setupDelay = 250 * time.Millisecond
+	const measureDuration = 200 * time.Millisecond
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(setupDelay)
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("测试服务器不支持 Flush")
+			return
+		}
+		flusher.Flush()
+		chunk := make([]byte, 4<<10)
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			default:
+				if _, err := w.Write(chunk); err != nil {
+					return
+				}
+				flusher.Flush()
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}))
+	defer proxy.Close()
+
+	port := testServerPort(t, proxy.URL)
+	wallStart := time.Now()
+	got, measured, err := downloadTimed(context.Background(), "http://download.example/test.bin", measureDuration, 0, 4, minBufSize, port)
+	wallElapsed := time.Since(wallStart)
+	if err != nil {
+		t.Fatalf("延迟响应后的多线程测速失败: %v", err)
+	}
+	if got == 0 {
+		t.Fatal("延迟响应后的吞吐窗口未收到数据")
+	}
+	if measured < measureDuration/2 || measured > measureDuration+250*time.Millisecond {
+		t.Fatalf("测速窗口为 %s，期望接近 %s", measured, measureDuration)
+	}
+	if wallElapsed-measured < setupDelay/2 {
+		t.Fatalf("响应准备时间疑似仍计入吞吐窗口: wall=%s measured=%s", wallElapsed, measured)
+	}
+}
+
+// 一条流都没等到 2xx 时，要报「卡在响应之前」，而不是拿窗口相关的字眼把排查带偏。
+func TestDownloadTimed多线程无流收到响应时报准备超时(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer proxy.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	port := testServerPort(t, proxy.URL)
+	_, _, err := downloadTimed(ctx, "http://download.example/test.bin", 100*time.Millisecond, 0, 4, minBufSize, port)
+	if err == nil {
+		t.Fatal("无流收到响应时必须失败")
+	}
+	if !strings.Contains(err.Error(), "等待下载响应超时") {
+		t.Fatalf("失败原因应说明卡在响应之前，实际为 %v", err)
+	}
 }

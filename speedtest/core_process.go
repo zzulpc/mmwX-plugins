@@ -22,6 +22,9 @@ const (
 	coreErrorMaxBytes = 4 << 10
 	coreReadyTimeout  = 15 * time.Second
 	coreKillWaitLimit = 2 * time.Second
+	// singBoxCheckTimeout 单独命名:它和 coreReadyTimeout 一起构成 runExecutionBudget 里
+	// 内核相关的那部分,改这里必须让 TestRun执行预算能装下所有阶段超时 重新过一遍。
+	singBoxCheckTimeout = 10 * time.Second
 )
 
 var (
@@ -178,7 +181,7 @@ func coreCommandArgs(runtimeInfo proxyRuntime, workdir, configPath string, check
 
 // checkSingBoxConfig 在真正启动前执行官方配置校验，失败时返回已脱敏的诊断。
 func checkSingBoxConfig(ctx context.Context, runtimeInfo proxyRuntime, workdir, configPath string, secrets []string) error {
-	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	checkCtx, cancel := context.WithTimeout(ctx, singBoxCheckTimeout)
 	defer cancel()
 	output := newBoundedTailBuffer(coreLogTailBytes)
 	command := exec.CommandContext(checkCtx, runtimeInfo.Bin, coreCommandArgs(runtimeInfo, workdir, configPath, true)...)

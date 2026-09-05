@@ -7,15 +7,18 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -53,7 +56,39 @@ const (
 	probeJobGrace = 5 * time.Second
 	// 单轮最多逐条打印多少个不可达目标。整批全挂(断网、上游拒绝)时不该刷几百行。
 	probeLogFailLimit = 20
+
+	// runQueueWaitBudget 任务排队等待 runMu 的上限。执行预算(runExecutionBudget)只在拿到
+	// runMu 之后才起算,两者相加才是一个 run 任务从收包到必须有结论的总时长。
+	// 排队超过这个数说明测速端是真的忙,回一条失败让主控稍后重试,比让它干等更有用。
+	runQueueWaitBudget = 60 * time.Second
+
+	// maxWSMessageBytes gorilla 默认不限帧长,被攻破或被冒充的主控发一帧就能把家用机打 OOM。
+	// 单节点 clash_config 撑死几 KB,200 个 probe 目标也就几 KB,4MB 已经是三个数量级的余量。
+	maxWSMessageBytes = 4 << 20
+
+	// 重连退避区间,以及「这条连接活多久才算真的连上过」。
+	// 之前是握手成功就把退避重置回 1s:主控如果先升级 WS 再鉴权失败、或者正在滚动重启,
+	// 每次都会立刻重置,退避形同虚设,退化成 1 秒一次的热重连。
+	minReconnectBackoff       = time.Second
+	maxReconnectBackoff       = 60 * time.Second
+	stableConnectionThreshold = 60 * time.Second
+
+	// ipv6CheckTTL hasIPv6 每次都要同步拨两次公网 v6(最坏 6s)才发得出 hello,
+	// 家庭网络抖动引起的频繁重连会被这段拨测放大。缓存一段时间,
+	// 又不至于在网络真从 v4-only 变成双栈之后一直报旧结论。
+	ipv6CheckTTL = 10 * time.Minute
+
+	// probeAllowPrivateEnv 放开内网/保留地址拨测。默认关闭:probe 是纯 TCP 拨测,
+	// 上限 200 目标 × 8 个在途任务,不限地址就等于给主控一个现成的家庭内网端口扫描器
+	//(「不当端口扫描器」这条约束原来只限了数量,没限地址)。
+	// 自建局域网节点确实需要探内网时,把这个变量设成 1。
+	probeAllowPrivateEnv = "MMWX_PROBE_ALLOW_PRIVATE"
 )
+
+// errProbeTargetNotPublic 在 Dialer.Control 里拦下已解析出的内网地址 —— 放在 Control 而不是
+// 入参校验里,是因为主控给的可能是域名:先自己解析再拨会改掉「no such host / 超时」这些
+// 排查误判时唯一的线索,而 Control 拿到的就是即将连接的那个地址,也没有 TOCTOU 缝隙。
+var errProbeTargetNotPublic = errors.New("目标为内网或保留地址,默认不拨测(设置 " + probeAllowPrivateEnv + "=1 放开)")
 
 var (
 	runJobSlots = make(chan struct{}, runConcurrency)
@@ -126,26 +161,42 @@ func main() {
 	log.Printf("[speedtester] %s 启动,主控=%s", *name, *master)
 	log.Printf("[speedtester] 拨号目标 %s", maskedURL(wsURL))
 
-	// 指数退避重连:1s → 2s → 4s ... 封顶 60s。connectAndServe 内每次成功握手后会通过
-	// resetBackoff 函数把它重置回 1s — 防止"一次断网长时间后,网恢复了仍要等 60s 才重连"。
-	backoff := time.Second
-	const maxBackoff = 60 * time.Second
-	resetBackoff := func() { backoff = time.Second }
+	// 指数退避重连:1s → 2s → 4s ... 封顶 60s。只有连接真的活过 stableConnectionThreshold
+	// 才把退避重置回 1s —— 防止"一次断网长时间后,网恢复了仍要等 60s 才重连",
+	// 同时不至于让"握手成功即断"的主控把退避彻底架空。
+	backoff := minReconnectBackoff
+	var establishedAt time.Time
+	onConnected := func() { establishedAt = time.Now() }
 	for {
-		err := connectAndServe(wsURL, *name, resetBackoff)
+		establishedAt = time.Time{}
+		err := connectAndServe(wsURL, *name, onConnected)
+		if !establishedAt.IsZero() && time.Since(establishedAt) >= stableConnectionThreshold {
+			backoff = minReconnectBackoff
+		}
+		delay := reconnectDelay(backoff)
 		if err != nil {
-			log.Printf("[speedtester] 连接断开: %v;%v 后重连", err, backoff)
+			log.Printf("[speedtester] 连接断开: %v;%v 后重连", err, delay.Round(time.Millisecond))
 		} else {
 			// 正常 return 大概率不会发生(内部 for-loop 只在 read error 时 return),
 			// 真发生也按短间隔重连
-			log.Printf("[speedtester] 连接结束;%v 后重连", backoff)
+			log.Printf("[speedtester] 连接结束;%v 后重连", delay.Round(time.Millisecond))
 		}
-		time.Sleep(backoff)
+		time.Sleep(delay)
 		backoff *= 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
+		if backoff > maxReconnectBackoff {
+			backoff = maxReconnectBackoff
 		}
 	}
+}
+
+// reconnectDelay 在退避基数上取 [backoff/2, backoff) 的随机值。主控重启时成百上千个家用
+// 测速端会同时掉线,固定间隔会让它们此后一直同步地成批冲击主控。
+func reconnectDelay(backoff time.Duration) time.Duration {
+	if backoff <= minReconnectBackoff {
+		backoff = minReconnectBackoff
+	}
+	half := backoff / 2
+	return half + time.Duration(rand.Int64N(int64(half)))
 }
 
 // maskedURL 隐藏 query 里的 token,避免日志泄露配对令牌。
@@ -179,7 +230,7 @@ const (
 )
 
 func connectAndServe(wsURL, name string, onConnected func()) error {
-	return connectAndServeWithIPv6Check(wsURL, name, onConnected, hasIPv6)
+	return connectAndServeWithIPv6Check(wsURL, name, onConnected, cachedHasIPv6)
 }
 
 // connectAndServeWithIPv6Check 把能力检测作为参数，便于用纯本地 WebSocket 验证连接生命周期，
@@ -210,9 +261,11 @@ func connectAndServeWithIPv6Check(wsURL, name string, onConnected func(), ipv6Ch
 	defer cancelConnection()
 	log.Printf("[speedtester] ✓ 已连接主控,发送 hello")
 	if onConnected != nil {
-		onConnected() // 重置 backoff,下次断开从 1s 重新开始
+		onConnected() // 记下建连时刻;活够 stableConnectionThreshold 才在断开后重置退避
 	}
 
+	// 单帧长度上限 — 见 maxWSMessageBytes:不设的话 gorilla 会为任意长度的帧一路分配内存。
+	conn.SetReadLimit(maxWSMessageBytes)
 	// 初始读超时 — 服务端必须在 readDeadline 内有任何消息(包括 pong),否则强制断
 	_ = conn.SetReadDeadline(time.Now().Add(readDeadline))
 	// 收到协议层 pong 也算"活着" — 把 deadline 续上
@@ -303,8 +356,11 @@ func connectAndServeWithIPv6Check(wsURL, name string, onConnected func(), ipv6Ch
 
 // dispatchRunJob 从收到消息时就启动超时，并继承连接取消；断线后的结果无法回传，
 // 不应让旧任务继续占用带宽。非阻塞信号量仍拒绝超出容量的任务。
+//
+// 总预算 = 排队等待 + 执行,不能像以前那样只给一份 38s:38s 既装不下单个任务各阶段超时之和
+// (见 runExecutionBudget),也没给 runMu 前面那三个在途任务留任何排队时间。
 func dispatchRunJob(parentCtx context.Context, job wsMsg, send func(wsMsg) error) {
-	ctx, cancel := context.WithTimeout(parentCtx, defaultTestDuration+30*time.Second)
+	ctx, cancel := context.WithTimeout(parentCtx, runQueueWaitBudget+runExecutionBudget)
 	if ctx.Err() != nil {
 		cancel()
 		return
@@ -450,6 +506,24 @@ func hasIPv6() bool {
 	return false
 }
 
+var (
+	ipv6CheckMu      sync.Mutex
+	ipv6CheckedAt    time.Time
+	ipv6CheckedValue bool
+)
+
+// cachedHasIPv6 给 hasIPv6 加 TTL 缓存,理由见 ipv6CheckTTL。
+func cachedHasIPv6() bool {
+	ipv6CheckMu.Lock()
+	defer ipv6CheckMu.Unlock()
+	if !ipv6CheckedAt.IsZero() && time.Since(ipv6CheckedAt) < ipv6CheckTTL {
+		return ipv6CheckedValue
+	}
+	ipv6CheckedValue = hasIPv6()
+	ipv6CheckedAt = time.Now()
+	return ipv6CheckedValue
+}
+
 // normalizedProbeTimeout 统一任务预算与实际拨号使用的单目标超时，避免二者口径漂移。
 func normalizedProbeTimeout(timeoutMS int) time.Duration {
 	// 先按毫秒整数比较再转 Duration，避免恶意极大整数在乘法时溢出成负值或短超时。
@@ -556,6 +630,35 @@ func runProbeWithDial(
 	}
 }
 
+// probeTargetAllowed 判断一个【已解析出的】地址能否拨测。net.IP.IsPrivate 只覆盖
+// 10/8、172.16/12、192.168/16 和 fc00::/7,CGNAT(100.64/10)与 IPv4 保留段(240/4)
+// 得自己补 —— 家用宽带落在 CGNAT 里的很常见,不补等于没拦。
+func probeTargetAllowed(ip net.IP) bool {
+	if ip == nil {
+		return true // 解析不出 IP 就交给拨号器自己报错,不在这里编造结论
+	}
+	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
+		return false
+	}
+	if v4 := ip.To4(); v4 != nil {
+		if v4[0] == 100 && v4[1]&0xc0 == 64 { // 100.64.0.0/10 CGNAT
+			return false
+		}
+		if v4[0] >= 240 { // 240.0.0.0/4 保留
+			return false
+		}
+	}
+	return true
+}
+
+// probeAllowsPrivateTargets 每次拨号都读一次环境变量:值本身来自进程启动环境的缓存,
+// 这个读取几乎不花钱,但能让运维改完变量重启即生效,也让测试能逐用例切换。
+func probeAllowsPrivateTargets() bool {
+	return strings.TrimSpace(os.Getenv(probeAllowPrivateEnv)) != ""
+}
+
 // dialProbe 拨一个 host:port,返回是否可达与握手耗时。
 func dialProbe(ctx context.Context, target string, timeout time.Duration) probeResult {
 	res := probeResult{Target: target}
@@ -565,6 +668,18 @@ func dialProbe(ctx context.Context, target string, timeout time.Duration) probeR
 	}
 	start := time.Now()
 	dialer := net.Dialer{Timeout: timeout}
+	if !probeAllowsPrivateTargets() {
+		dialer.Control = func(_, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil
+			}
+			if !probeTargetAllowed(net.ParseIP(host)) {
+				return errProbeTargetNotPublic
+			}
+			return nil
+		}
+	}
 	conn, err := dialer.DialContext(ctx, "tcp", target)
 	if err != nil {
 		res.Error = err.Error()

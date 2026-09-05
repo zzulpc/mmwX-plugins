@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"strconv"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -87,7 +88,7 @@ func TestBuildMihomoConfigKeepsNumericTypes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("解析回归节点失败: %v", err)
 	}
-	content, err := buildMihomoConfig(proxy, "回归节点", 19006)
+	content, err := buildMihomoConfig(proxy, 19006)
 	if err != nil {
 		t.Fatalf("生成 Mihomo 配置失败: %v", err)
 	}
@@ -103,5 +104,44 @@ func TestBuildMihomoConfigKeepsNumericTypes(t *testing.T) {
 	pluginOptions := node["plugin-opts"].(map[string]any)
 	if _, isString := pluginOptions["ratio"].(string); isString {
 		t.Fatalf("嵌套小数被错误写成字符串: %#v", pluginOptions["ratio"])
+	}
+}
+
+// 节点名来自订阅、由用户可控。撞上 mihomo 预置的 DIRECT/REJECT/GLOBAL 或本地分组名时，
+// mihomo 会以「名字重复」拒绝加载,用户只看得到「内核在端口就绪前退出」这种指不到根因的错。
+// 生成配置里必须永远用固定的内部名,和主控给的名字彻底解耦。
+func TestBuildMihomoConfig固定内部节点名(t *testing.T) {
+	for _, hostileName := range []string{"PROXY", "DIRECT", "REJECT", "GLOBAL", mihomoGroupTag, ""} {
+		proxy, err := parseClashProxy(`{"name":` + strconv.Quote(hostileName) +
+			`,"type":"vmess","server":"127.0.0.1","port":443,"uuid":"00000000-0000-0000-0000-000000000000"}`)
+		if err != nil {
+			t.Fatalf("解析节点失败: %v", err)
+		}
+		content, err := buildMihomoConfig(proxy, 19007)
+		if err != nil {
+			t.Fatalf("节点名 %q 生成配置失败: %v", hostileName, err)
+		}
+		var decoded map[string]any
+		if err := yaml.Unmarshal(content, &decoded); err != nil {
+			t.Fatalf("解析 Mihomo YAML 失败: %v", err)
+		}
+		node := decoded["proxies"].([]any)[0].(map[string]any)
+		if got := node["name"]; got != mihomoNodeTag {
+			t.Fatalf("节点名 %q 未被替换为内部名: %#v", hostileName, got)
+		}
+		group := decoded["proxy-groups"].([]any)[0].(map[string]any)
+		if got := group["name"]; got != mihomoGroupTag {
+			t.Fatalf("分组名不符: %#v", got)
+		}
+		if members := group["proxies"].([]any); len(members) != 1 || members[0] != mihomoNodeTag {
+			t.Fatalf("分组成员未指向内部节点名: %#v", members)
+		}
+		if got := decoded["rules"].([]any)[0]; got != "MATCH,"+mihomoGroupTag {
+			t.Fatalf("规则未指向本地分组: %#v", got)
+		}
+		// external-controller 是无鉴权管理接口，测速流程用不到，同机其它用户却能拿它改配置。
+		if _, exists := decoded["external-controller"]; exists {
+			t.Fatal("生成配置不应再开启 external-controller")
+		}
 	}
 }

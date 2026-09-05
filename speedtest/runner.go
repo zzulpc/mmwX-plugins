@@ -29,6 +29,31 @@ const (
 	cfLatencySamples    = 3                                        // 真延迟采样次数,取最快 2 个均值(去掉首包冷启动)
 )
 
+// 单次测速各阶段的超时上限,以及必须能把它们全部装下的执行预算。
+//
+// 这笔加法以前没人做过:任务预算写死成 defaultTestDuration+30s = 38s,而各阶段上限加起来是
+// 15(内核就绪)+10(sing-box check)+8(出口 IP)+10(延迟)+10(下载准备)+8(吞吐)= 51~61s。
+// 结果是「慢但能用」的节点走到下载阶段时剩余时间已经不够,报出
+// 「测速任务剩余时间不足以完成 8s 吞吐测试」—— 看着像节点坏了,其实是自家预算算错了。
+// TestRun执行预算能装下所有阶段超时 把这笔加法钉死:改任何一个阶段超时都必须同步过它。
+const (
+	egressProbeTimeout     = 5 * time.Second  // 出口 IP 回显
+	latencyProbeTimeout    = 5 * time.Second  // 普通 204 延迟探测
+	cfLatencySampleTimeout = 4 * time.Second  // LatencyOnly 单次采样
+	cfLatencyTotalTimeout  = 12 * time.Second // LatencyOnly 整个采样阶段(3 次采样共用)
+	downloadSetupTime      = 10 * time.Second // 首个 2xx 的独立准备预算,不挤占吞吐窗口
+	runPhaseMargin         = 5 * time.Second  // 进程启停、临时目录、调度等零碎开销
+
+	// latencyProbeBodyLimit:204 端点本该零字节,这里只是把"万一不是它"的读取封住。
+	latencyProbeBodyLimit = 4 << 10
+
+	// runExecutionBudget 只从任务拿到 runMu 之后开始走,不含排队等待 —— 排队预算见 main.go
+	// 的 runQueueWaitBudget。两者以前混在一起,4 个在途任务共用同一个 38s 时钟,
+	// 排在后面的任务会被前面的执行时间吃光预算。
+	runExecutionBudget = coreReadyTimeout + singBoxCheckTimeout + egressProbeTimeout +
+		latencyProbeTimeout + downloadSetupTime + defaultTestDuration + runPhaseMargin
+)
+
 // runMu 串行化测速:一次只跑一个节点,避免并发抢带宽导致结果失真。
 var runMu sync.Mutex
 
@@ -52,22 +77,28 @@ type Options struct {
 	LatencyOnly  bool // true 仅测真连接延迟(Cloudflare 204 多采样)不跑大文件下载
 }
 
-// 测速 buffer / 线程的取值边界。峰值内存 ≈ BufSize × Threads,maxSpeedTotalMem 防家用测速端 OOM。
+// 测速 buffer / 线程的取值边界。峰值内存 ≈ BufSize × Threads × downloadBuffersPerThread,
+// maxSpeedTotalMem 防家用测速端 OOM。
 const (
-	defaultBufSize    = 1 << 20          // 1MB(= 历史固定值,向后兼容)
-	minBufSize        = 64 << 10         // 64KB
-	maxBufSize        = 16 << 20         // 16MB
-	maxSpeedThreads   = 64               // 并发下载线程上限
-	maxSpeedTotalMem  = 256 << 20        // BufSize×Threads 上限:超了缩 BufSize
-	downloadSetupTime = 10 * time.Second // 单线程首个 2xx 的独立准备预算，不挤占 8 秒吞吐窗口
+	defaultBufSize   = 1 << 20   // 1MB(= 历史固定值,向后兼容)
+	minBufSize       = 64 << 10  // 64KB
+	maxBufSize       = 16 << 20  // 16MB
+	maxSpeedThreads  = 64        // 并发下载线程上限
+	maxSpeedTotalMem = 256 << 20 // 峰值内存上限:超了缩 BufSize
+	// downloadBuffersPerThread:每条下载流实际占两份 bufSize —— io.CopyBuffer 的 buffer 一份,
+	// 该线程自己那个 http.Transport 的 ReadBufferSize 又一份(见 newProxyTransport)。
+	// 原来只按一份算,64 线程 × 4MB 实际吃掉 ~512MB,是这个 256MB 闸门的两倍。
+	downloadBuffersPerThread = 2
 )
 
 var (
 	errDownloadWindowExpired = errors.New("下载测速窗口已结束")
 	errDownloadQuotaReached  = errors.New("下载字节额度已用尽")
+	errDownloadSetupExpired  = errors.New("等待首个下载响应超时")
 )
 
-// clampSpeedTestParams 归一 bufSize(字节)与 threads,并把 bufSize×threads 峰值内存收敛到 maxSpeedTotalMem 内。
+// clampSpeedTestParams 归一 bufSize(字节)与 threads,并把峰值内存收敛到 maxSpeedTotalMem 内。
+// 峰值按 bufSize × threads × downloadBuffersPerThread 算,不是只算 copy buffer 那一份。
 // 0/越界回落默认(bufSize=1MB, threads=1)。
 func clampSpeedTestParams(bufSize, threads int) (int, int) {
 	if threads <= 0 {
@@ -85,8 +116,8 @@ func clampSpeedTestParams(bufSize, threads int) (int, int) {
 	if bufSize > maxBufSize {
 		bufSize = maxBufSize
 	}
-	if int64(bufSize)*int64(threads) > maxSpeedTotalMem {
-		bufSize = maxSpeedTotalMem / threads
+	if int64(bufSize)*int64(threads)*downloadBuffersPerThread > maxSpeedTotalMem {
+		bufSize = int(int64(maxSpeedTotalMem) / (int64(threads) * downloadBuffersPerThread))
 		if bufSize < minBufSize {
 			bufSize = minBufSize
 		}
@@ -100,16 +131,20 @@ func RunNodeTest(ctx context.Context, runtimeInfo proxyRuntime, clashConfigJSON 
 		opts.TestDuration = defaultTestDuration
 	}
 	if opts.Timeout <= 0 {
-		opts.Timeout = opts.TestDuration + 30*time.Second
+		opts.Timeout = runExecutionBudget
 	}
-	ctx, cancel := context.WithTimeout(ctx, opts.Timeout)
-	defer cancel()
 
+	// 执行预算必须等拿到 runMu 之后再起算。以前是在排队之前就 WithTimeout:runConcurrency=4
+	// 允许 4 个在途任务,但真正测速是 runMu 串行的,四个任务共用各自那个 38s 时钟 ——
+	// 排第 3、第 4 位的任务光排队就耗光预算,以「等待执行超时」失败,主控看着像节点坏了。
+	// 排队本身的上限由调用方(dispatchRunJob 的 runQueueWaitBudget)通过父 ctx 施加。
 	runMu.Lock()
 	defer runMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return Result{}, fmt.Errorf("测速任务等待执行超时: %w", err)
 	}
+	ctx, cancel := context.WithTimeout(ctx, opts.Timeout)
+	defer cancel()
 
 	testURL := opts.TestURL
 	if testURL == "" {
@@ -127,12 +162,6 @@ func RunNodeTest(ctx context.Context, runtimeInfo proxyRuntime, clashConfigJSON 
 	if selectedCore != runtimeInfo.Core {
 		return Result{}, fmt.Errorf("节点需要 %s，但任务准备的是 %s", selectedCore, runtimeInfo.Core)
 	}
-	name, _ := proxy["name"].(string)
-	if name == "" {
-		name = "node"
-		proxy["name"] = name
-	}
-
 	mixedPort, err := reserveLoopbackPort()
 	if err != nil {
 		return Result{}, err
@@ -146,7 +175,7 @@ func RunNodeTest(ctx context.Context, runtimeInfo proxyRuntime, clashConfigJSON 
 		config, err = buildSingBoxConfig(proxy, mixedPort)
 		configName = "config.json"
 	case coreMihomo:
-		config, err = buildMihomoConfig(proxy, name, mixedPort)
+		config, err = buildMihomoConfig(proxy, mixedPort)
 		configName = "config.yaml"
 	default:
 		return Result{}, fmt.Errorf("未知代理内核: %s", runtimeInfo.Core)
@@ -206,23 +235,36 @@ func RunNodeTest(ctx context.Context, runtimeInfo proxyRuntime, clashConfigJSON 
 	return Result{DownMbps: mbps, LatencyMs: latency, Bytes: n, Duration: dur, EgressIP: egressIP}, nil
 }
 
+// 生成配置里固定使用的节点名与分组名。
+//
+// 绝不能沿用主控下发的节点名:它来自订阅、由用户可控。撞上 mihomo 预置的 DIRECT / REJECT /
+// GLOBAL / PASS / COMPATIBLE,或者撞上下面这个分组名,mihomo 都会以「名字重复」直接拒绝
+// 加载配置 —— 用户只看得到一句「mihomo 在本地代理端口就绪前退出」,完全指不到根因。
+// 这个名字只在临时配置内部用于把 rules 指向唯一那个出站,不参与任何对外展示。
+const (
+	mihomoNodeTag  = "node-under-test"
+	mihomoGroupTag = "MMWX-SPEEDTEST"
+)
+
 // buildMihomoConfig 保留原有单节点 Clash 配置路径，仅把本地端口改为每任务动态分配。
-func buildMihomoConfig(proxy map[string]any, name string, mixedPort int) ([]byte, error) {
+func buildMihomoConfig(proxy map[string]any, mixedPort int) ([]byte, error) {
 	normalizedProxy, ok := normalizeJSONNumbers(proxy).(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("规范化 Mihomo 节点配置失败")
 	}
+	normalizedProxy["name"] = mihomoNodeTag
 	mini := map[string]any{
-		"mixed-port":          mixedPort,
-		"allow-lan":           false,
-		"mode":                "rule",
-		"log-level":           "warning",
-		"external-controller": "127.0.0.1:0",
-		"proxies":             []map[string]any{normalizedProxy},
+		"mixed-port": mixedPort,
+		"allow-lan":  false,
+		"mode":       "rule",
+		"log-level":  "warning",
+		// 不开 external-controller:测速流程一次都没用到它,而它是个无鉴权的管理接口,
+		// 同机上的其它用户在测速窗口内可以拿它改配置、读连接表。
+		"proxies": []map[string]any{normalizedProxy},
 		"proxy-groups": []map[string]any{
-			{"name": "PROXY", "type": "select", "proxies": []string{name}},
+			{"name": mihomoGroupTag, "type": "select", "proxies": []string{mihomoNodeTag}},
 		},
-		"rules": []string{"MATCH,PROXY"},
+		"rules": []string{"MATCH," + mihomoGroupTag},
 	}
 	config, err := yaml.Marshal(mini)
 	if err != nil {
@@ -248,7 +290,7 @@ func reserveLoopbackPort() (int, error) {
 func measureEgressIP(ctx context.Context, mixedPort int) string {
 	client := proxyClient(mixedPort)
 	defer client.CloseIdleConnections()
-	client.Timeout = 8 * time.Second
+	client.Timeout = egressProbeTimeout
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, egressIPProbeURL, nil)
 	if err != nil {
 		return ""
@@ -272,8 +314,9 @@ func measureEgressIP(ctx context.Context, mixedPort int) string {
 	return ip
 }
 
-// proxyClient 经本次任务的 mixed 入站走代理。
-// 单流测速调优:1MB ReadBufferSize / 禁 HTTP/2(单流被流控限速)/ 禁 Compression / 复用 Transport
+// proxyClient 经本次任务的 mixed 入站走代理。每次调用都新建一个 Transport(短探测各自独立,
+// 且必须能各自 CloseIdleConnections),不是共享的。
+// 单流测速调优:1MB ReadBufferSize / 禁 HTTP/2(单流被流控限速)/ 禁 Compression
 func proxyClient(mixedPort int) *http.Client {
 	return &http.Client{Transport: newProxyTransport(mixedPort, defaultBufSize)}
 }
@@ -321,10 +364,13 @@ func getCopyBuf(size int) *[]byte {
 func putCopyBuf(b *[]byte) { copyBufPool.Put(b) }
 
 // measureLatency 经代理 GET 一个 204 端点,返回毫秒;失败返回 -1。
+//
+// 必须看状态码:落地门户、上游错误页也会很快回 200,只认"没报错"就会把一个又快又假的
+// 延迟当成真结果。响应体同时限长 —— 204 端点本该是空的,回来一大坨就说明这不是它。
 func measureLatency(ctx context.Context, mixedPort int) int64 {
 	client := proxyClient(mixedPort)
 	defer client.CloseIdleConnections()
-	client.Timeout = 10 * time.Second
+	client.Timeout = latencyProbeTimeout
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, latencyProbeURL, nil)
 	if err != nil {
 		return -1
@@ -334,26 +380,35 @@ func measureLatency(ctx context.Context, mixedPort int) int64 {
 	if err != nil {
 		return -1
 	}
-	io.Copy(io.Discard, resp.Body)
+	io.Copy(io.Discard, io.LimitReader(resp.Body, latencyProbeBodyLimit))
 	resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return -1
+	}
 	return time.Since(start).Milliseconds()
 }
 
 // measureLatencyCloudflare 用 Cloudflare 204 多次采样,取最快 2 个均值;
 // 首包受 TLS 握手 / mihomo cold-start 影响,平均后更接近"真连接延迟"。全部失败返回 -1。
+//
+// 整个采样阶段另有 cfLatencyTotalTimeout 兜底:单次超时 × 采样数会突破 runExecutionBudget
+// 里为这一阶段留的份额,而 LatencyOnly 任务后面还要靠这个预算收尾。
+// 非 2xx 的样本直接丢弃(理由同 measureLatency),一个都没有就返回 -1,由调用方回报失败。
 func measureLatencyCloudflare(ctx context.Context, mixedPort, samples int) int64 {
 	if samples <= 0 {
 		samples = cfLatencySamples
 	}
+	phaseCtx, cancelPhase := context.WithTimeout(ctx, cfLatencyTotalTimeout)
+	defer cancelPhase()
 	client := proxyClient(mixedPort)
 	defer client.CloseIdleConnections()
-	client.Timeout = 8 * time.Second
+	client.Timeout = cfLatencySampleTimeout
 	probes := make([]int64, 0, samples)
 	for i := 0; i < samples; i++ {
-		if ctx.Err() != nil {
+		if phaseCtx.Err() != nil {
 			break
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfLatencyProbeURL, nil)
+		req, err := http.NewRequestWithContext(phaseCtx, http.MethodGet, cfLatencyProbeURL, nil)
 		if err != nil {
 			continue
 		}
@@ -362,8 +417,11 @@ func measureLatencyCloudflare(ctx context.Context, mixedPort, samples int) int64
 		if err != nil {
 			continue
 		}
-		io.Copy(io.Discard, resp.Body)
+		io.Copy(io.Discard, io.LimitReader(resp.Body, latencyProbeBodyLimit))
 		resp.Body.Close()
+		if resp.StatusCode/100 != 2 {
+			continue
+		}
 		probes = append(probes, time.Since(start).Milliseconds())
 	}
 	if len(probes) == 0 {
@@ -446,32 +504,44 @@ func downloadTimed(ctx context.Context, dlURL string, dur time.Duration, maxByte
 		return downloadSingleTimed(ctx, dlURL, dur, maxBytes, bufSize, mixedPort)
 	}
 
-	timedCtx, stopTimer := context.WithTimeoutCause(ctx, dur, errDownloadWindowExpired)
-	defer stopTimer()
-	dlCtx, cancel := context.WithCancelCause(timedCtx)
-	defer cancel(context.Canceled)
+	// 多线程也必须走 downloadWindow。以前这里直接 WithTimeoutCause(ctx, dur) 并从协程起飞
+	// 就开始计时:代理握手 + TLS + TTFB 全被算进了速率的分母,而字节要等 2xx 之后才进账。
+	// 实测 setup 400ms / 窗口 800ms 时低估 50%,生产参数(8s 窗口、远端节点)低估 10~25%,
+	// 延迟越高压得越狠 —— 恰好把用户最想横向比较的远端节点系统性地报低。
+	// 单线程路径 v0.2.3 就修过同一个问题,多线程当时漏掉了。
+	dlCtx, window, err := newDownloadWindow(ctx, dur)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer window.stop()
 
 	var wg sync.WaitGroup
 	results := make([]int64, threads)
 	errs := make([]error, threads)
 	var quota *sharedDownloadQuota
 	if maxBytes > 0 {
-		quota = &sharedDownloadQuota{maxBytes: maxBytes, cancel: cancel}
+		quota = &sharedDownloadQuota{maxBytes: maxBytes, cancel: window.cancel}
 	}
-	start := time.Now()
 	for i := range threads {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			n, _, _, _, e := downloadSingleAttempt(dlCtx, dlURL, maxBytes, bufSize, mixedPort, quota, nil)
+			// 最先拿到 2xx 的那条流启动窗口。后到的流少测一点,这是多线程固有的,
+			// 但比把每条流的 setup 都计进分母小一个数量级。
+			n, _, _, _, e := downloadSingleAttempt(dlCtx, dlURL, maxBytes, bufSize, mixedPort, quota, window.startMeasurement)
 			results[idx] = n
 			errs[idx] = e
 		}(i)
 	}
 	wg.Wait()
-	elapsed := time.Since(start)
+	elapsed := window.elapsed()
 	if err := ctx.Err(); err != nil {
 		return 0, elapsed, err
+	}
+	if window.setupExpired.Load() {
+		// 一条流都没等到 2xx。此时所有 errs 都是被 setup 取消后的 context.Canceled,
+		// 报窗口相关的错会误导排查方向,直接说清楚是卡在响应之前。
+		return 0, elapsed, fmt.Errorf("等待下载响应超时: %d 条流均未收到有效响应", threads)
 	}
 
 	var total int64
@@ -515,11 +585,13 @@ func isExpectedDownloadStop(cause, err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
-// singleDownloadWindow 把“等待首个有效响应”和“吞吐计时”分开。
-// 同一个窗口最多容纳三次串行请求，断流重试不会额外获得一份测速时长或字节额度。
-type singleDownloadWindow struct {
+// downloadWindow 把“等待首个有效响应”和“吞吐计时”分开:计时只从第一个 2xx 开始走,
+// 代理握手 / TLS / TTFB 落在独立的 setup 预算里,不进吞吐速率的分母。
+// 单线程下同一个窗口最多容纳三次串行请求，断流重试不会额外获得一份测速时长或字节额度;
+// 多线程下由最先拿到 2xx 的那条流启动窗口，其余线程共用同一份时长与额度。
+type downloadWindow struct {
 	duration           time.Duration
-	cancel             context.CancelFunc
+	cancel             context.CancelCauseFunc
 	startOnce          sync.Once
 	mu                 sync.Mutex
 	startedAt          time.Time
@@ -529,7 +601,9 @@ type singleDownloadWindow struct {
 	measurementTimer   *time.Timer
 }
 
-func newSingleDownloadWindow(ctx context.Context, dur time.Duration) (context.Context, *singleDownloadWindow, error) {
+// newDownloadWindow 用 WithCancelCause 而不是 WithCancel:多线程路径要靠 context.Cause
+// 区分「窗口正常到点」「额度用满」和「真的出错了」,只看 context.Canceled 是分不出来的。
+func newDownloadWindow(ctx context.Context, dur time.Duration) (context.Context, *downloadWindow, error) {
 	setupBudget := downloadSetupTime
 	if deadline, ok := ctx.Deadline(); ok {
 		remaining := time.Until(deadline) - dur
@@ -541,20 +615,20 @@ func newSingleDownloadWindow(ctx context.Context, dur time.Duration) (context.Co
 		}
 	}
 
-	downloadCtx, cancel := context.WithCancel(ctx)
-	window := &singleDownloadWindow{duration: dur, cancel: cancel}
+	downloadCtx, cancel := context.WithCancelCause(ctx)
+	window := &downloadWindow{duration: dur, cancel: cancel}
 	window.setupTimer = time.AfterFunc(setupBudget, func() {
 		window.mu.Lock()
 		defer window.mu.Unlock()
 		if window.startedAt.IsZero() {
 			window.setupExpired.Store(true)
-			cancel()
+			cancel(errDownloadSetupExpired)
 		}
 	})
 	return downloadCtx, window, nil
 }
 
-func (w *singleDownloadWindow) startMeasurement() {
+func (w *downloadWindow) startMeasurement() {
 	w.startOnce.Do(func() {
 		w.mu.Lock()
 		defer w.mu.Unlock()
@@ -565,26 +639,30 @@ func (w *singleDownloadWindow) startMeasurement() {
 		w.startedAt = time.Now()
 		w.measurementTimer = time.AfterFunc(w.duration, func() {
 			w.measurementExpired.Store(true)
-			w.cancel()
+			w.cancel(errDownloadWindowExpired)
 		})
 	})
 }
 
-func (w *singleDownloadWindow) elapsed() time.Duration {
+// elapsed 取锁读 startedAt:多线程路径里 startMeasurement 由 worker 协程调用,
+// 而 elapsed 由协调协程调用,不能靠“同一个协程”这个单线程才成立的前提。
+func (w *downloadWindow) elapsed() time.Duration {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.startedAt.IsZero() {
 		return 0
 	}
 	return time.Since(w.startedAt)
 }
 
-func (w *singleDownloadWindow) stop() {
+func (w *downloadWindow) stop() {
 	if w.setupTimer != nil {
 		w.setupTimer.Stop()
 	}
 	if w.measurementTimer != nil {
 		w.measurementTimer.Stop()
 	}
-	w.cancel()
+	w.cancel(context.Canceled)
 }
 
 // singleDownloadRetryDelay 给首个 2xx 前的两次重试留出递增的协议恢复时间。延迟仍受
@@ -614,7 +692,7 @@ func waitSingleDownloadRetry(ctx context.Context, delay time.Duration) error {
 }
 
 func downloadSingleTimed(ctx context.Context, dlURL string, dur time.Duration, maxBytes int64, bufSize, mixedPort int) (int64, time.Duration, error) {
-	downloadCtx, window, err := newSingleDownloadWindow(ctx, dur)
+	downloadCtx, window, err := newDownloadWindow(ctx, dur)
 	if err != nil {
 		return 0, 0, err
 	}

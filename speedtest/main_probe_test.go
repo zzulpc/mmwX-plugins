@@ -299,6 +299,8 @@ func TestConnectAndServe断线取消该连接派发的Probe(t *testing.T) {
 }
 
 func TestDialProbe(t *testing.T) {
+	// 本用例整套目标都在回环上，必须显式放开内网拨测；默认拒绝的行为由下一个用例覆盖。
+	t.Setenv(probeAllowPrivateEnv, "1")
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("创建测试监听失败: %v", err)
@@ -376,4 +378,61 @@ func waitForSlotCount(t *testing.T, slots chan struct{}, want int, timeout time.
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("%s 数量=%d，期望=%d", label, len(slots), want)
+}
+
+// probe 是纯 TCP 拨测,单条消息 200 个目标、8 个在途任务。不限地址的话,主控(或被攻破的
+// 主控)拿它就能扫遍家庭内网 —— 「不当端口扫描器」这条约束原来只限了数量,没限地址。
+func TestDialProbe默认拒绝内网与保留地址(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("创建测试监听失败: %v", err)
+	}
+	defer listener.Close()
+
+	// 回环上真的有人在听:被拒是因为地址,不是因为连不上。
+	result := dialProbe(context.Background(), listener.Addr().String(), time.Second)
+	if result.OK {
+		t.Fatalf("默认配置下不应拨通回环目标: %#v", result)
+	}
+	if !strings.Contains(result.Error, probeAllowPrivateEnv) {
+		t.Fatalf("拒绝原因应指明放开方式，实际为 %q", result.Error)
+	}
+
+	for _, target := range []string{
+		"10.0.0.1:80", "172.16.0.1:80", "192.168.1.1:80",
+		"169.254.1.1:80", "100.64.0.1:80", "240.0.0.1:80",
+		"[::1]:80", "[fc00::1]:80", "[fe80::1]:80",
+	} {
+		if got := dialProbe(context.Background(), target, 200*time.Millisecond); got.OK {
+			t.Fatalf("内网/保留地址 %s 不应判定为通: %#v", target, got)
+		}
+	}
+
+	// 公网地址不受影响:这里只校验没有被 Control 提前拦掉，连通与否交给网络环境。
+	if got := dialProbe(context.Background(), "203.0.113.1:80", 50*time.Millisecond); strings.Contains(got.Error, probeAllowPrivateEnv) {
+		t.Fatalf("公网地址被误拦: %#v", got)
+	}
+}
+
+func TestProbeTargetAllowed(t *testing.T) {
+	blocked := []string{
+		"127.0.0.1", "0.0.0.0", "10.1.2.3", "172.31.255.255", "192.168.0.1",
+		"169.254.169.254", "100.64.0.1", "100.127.255.255", "224.0.0.1", "240.1.2.3",
+		"::1", "::", "fc00::1", "fd00::1", "fe80::1", "ff02::1",
+	}
+	for _, raw := range blocked {
+		if probeTargetAllowed(net.ParseIP(raw)) {
+			t.Fatalf("%s 应被判定为内网/保留地址", raw)
+		}
+	}
+	allowed := []string{"1.1.1.1", "8.8.8.8", "203.0.113.1", "100.63.255.255", "100.128.0.1", "2606:4700:4700::1111"}
+	for _, raw := range allowed {
+		if !probeTargetAllowed(net.ParseIP(raw)) {
+			t.Fatalf("%s 应被判定为公网地址", raw)
+		}
+	}
+	// 解析不出 IP 时不在这里编造结论，交给拨号器报真实的解析错误。
+	if !probeTargetAllowed(nil) {
+		t.Fatal("无法解析的地址不应在 Control 里被拦下")
+	}
 }
