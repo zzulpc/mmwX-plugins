@@ -35,9 +35,11 @@ cd proxyparser && go build ./... && go vet ./... && go test ./... -count=1
 cd speedtest && go build ./... && go vet ./... && go test ./... -count=1
 ```
 
-基线（2026-08-26，Go 1.27.0）：两者都干净通过，`go vet` 无告警。
-覆盖率（`go test ./... -cover -count=1`）：`proxyparser` 46.0%、
-`proxyparser/internal/valueutil` 74.2%、`proxyparser/substore` 42.6%、`speedtest` 62.3%。
+基线（2026-09-05，Go 1.26.8，与发布工具链一致）：两者都干净通过，`go vet` 无告警。
+覆盖率（`go test ./... -cover -count=1`）：`proxyparser` 44.5%、
+`proxyparser/internal/valueutil` 74.2%、`proxyparser/substore` 40.5%、`speedtest` 67.3%。
+请在同一 Go 工具链下比较覆盖率，不要直接与旧 Go 1.27.0 基线混用；跨包往返测试
+位于 `proxyparser/roundtrip`，其调用默认不计入被调用包的覆盖率。
 **改完测试顺手把这几个数对一遍**，基线错了会让人误以为新加的测试没生效。
 
 **改完代码必须自己跑上面的命令**，不要只说「应该没问题」。

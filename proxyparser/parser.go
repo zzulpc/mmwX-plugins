@@ -41,7 +41,7 @@ func base64DecodeURLSafe(s string) (string, error) {
 	return string(decoded), nil
 }
 
-// parseQueryParams parses URL query string into map
+// parseQueryParams 统一解码查询参数；调用方应直接使用结果，避免再次解码破坏 + 或 %XX。
 func parseQueryParams(query string) map[string]string {
 	params := make(map[string]string)
 	if query == "" {
@@ -179,6 +179,11 @@ func parseVmessURL(uri string) (map[string]any, error) {
 	alterId := getInt(config, "aid", 0)
 	cipher := getString(config, "scy", "auto")
 	network := getString(config, "net", "tcp")
+	httpUpgrade := network == "httpupgrade"
+	if httpUpgrade {
+		// 客户端转换与 URI 导出统一使用 ws-opts 中的标记表示 HTTPUpgrade。
+		network = "ws"
+	}
 	tls := getString(config, "tls", "")
 
 	udp := true
@@ -207,11 +212,12 @@ func parseVmessURL(uri string) (map[string]any, error) {
 	// TLS
 	node["tls"] = tls == "tls"
 
+	// VMess JSON 字段已是原始文本，再作 URI 解码会改变导出端写入的路径或主机名。
 	// SNI/Servername
 	if _, ok := config["sni"]; ok {
-		node["servername"] = safeDecodeURIComponent(getString(config, "sni", ""))
+		node["servername"] = getString(config, "sni", "")
 	} else if host := getString(config, "host", ""); host != "" && tls == "tls" {
-		node["servername"] = safeDecodeURIComponent(host)
+		node["servername"] = host
 	}
 
 	// ALPN
@@ -245,10 +251,13 @@ func parseVmessURL(uri string) (map[string]any, error) {
 	// WebSocket
 	if network == "ws" {
 		wsOpts := map[string]any{
-			"path": safeDecodeURIComponent(getString(config, "path", "/")),
+			"path": getString(config, "path", "/"),
+		}
+		if httpUpgrade {
+			wsOpts["v2ray-http-upgrade"] = true
 		}
 		if host := getString(config, "host", ""); host != "" {
-			wsOpts["headers"] = map[string]string{"Host": safeDecodeURIComponent(host)}
+			wsOpts["headers"] = map[string]string{"Host": host}
 		} else {
 			wsOpts["headers"] = map[string]string{}
 		}
@@ -258,10 +267,10 @@ func parseVmessURL(uri string) (map[string]any, error) {
 	// HTTP/2
 	if network == "h2" {
 		h2Opts := map[string]any{
-			"path": safeDecodeURIComponent(getString(config, "path", "/")),
+			"path": getString(config, "path", "/"),
 		}
 		if host := getString(config, "host", ""); host != "" {
-			h2Opts["host"] = []string{safeDecodeURIComponent(host)}
+			h2Opts["host"] = []string{host}
 		} else {
 			h2Opts["host"] = []string{}
 		}
@@ -271,11 +280,11 @@ func parseVmessURL(uri string) (map[string]any, error) {
 	// gRPC
 	if network == "grpc" {
 		grpcOpts := map[string]any{
-			"grpc-service-name": safeDecodeURIComponent(getString(config, "path", getString(config, "grpc-service-name", ""))),
+			"grpc-service-name": getString(config, "path", getString(config, "grpc-service-name", "")),
 		}
 		if authority := getString(config, "host", ""); authority != "" {
 			// VMess JSON 没有独立的 authority 字段，host 是 gRPC authority 的唯一载体。
-			grpcOpts["_grpc-authority"] = safeDecodeURIComponent(authority)
+			grpcOpts["_grpc-authority"] = authority
 		}
 		node["grpc-opts"] = grpcOpts
 	}
@@ -618,12 +627,8 @@ func parseSocksURL(uri string) (map[string]any, error) {
 
 	atIdx := strings.LastIndex(mainPart, "@")
 	if atIdx == -1 {
-		// No auth
-		parts := strings.Split(mainPart, ":")
-		server = parts[0]
-		if len(parts) > 1 {
-			port, _ = strconv.Atoi(parts[1])
-		}
+		// 无认证链接也可能使用方括号包裹的 IPv6，不能按每个冒号切分。
+		server, port = parseServerPortWithDefault(mainPart, 0)
 	} else {
 		authPart := mainPart[:atIdx]
 		serverPart := mainPart[atIdx+1:]
@@ -732,11 +737,11 @@ func parseTrojanURL(uri string) (map[string]any, error) {
 
 	// SNI (支持显式空字符串)
 	if sni, ok := queryParams["sni"]; ok {
-		node["sni"] = safeDecodeURIComponent(sni)
+		node["sni"] = sni
 	} else if peer, ok := queryParams["peer"]; ok {
-		node["sni"] = safeDecodeURIComponent(peer)
+		node["sni"] = peer
 	} else if host, ok := queryParams["host"]; ok {
-		node["sni"] = safeDecodeURIComponent(host)
+		node["sni"] = host
 	}
 
 	// Network
@@ -744,26 +749,34 @@ func parseTrojanURL(uri string) (map[string]any, error) {
 	if network == "" {
 		network = "tcp"
 	}
+	httpUpgrade := network == "httpupgrade"
+	if httpUpgrade {
+		// 与 URI 导出端约定一致，保留升级传输所需的 Host、path 和标记。
+		network = "ws"
+	}
 	node["network"] = network
 
 	// Transport options
 	if network == "ws" {
 		wsOpts := map[string]any{
-			"path": safeDecodeURIComponent(queryParams["path"]),
+			"path": queryParams["path"],
 		}
 		if wsOpts["path"] == "" {
 			wsOpts["path"] = "/"
 		}
 		if host := queryParams["host"]; host != "" {
-			wsOpts["headers"] = map[string]string{"Host": safeDecodeURIComponent(host)}
+			wsOpts["headers"] = map[string]string{"Host": host}
 		} else {
 			wsOpts["headers"] = map[string]string{}
+		}
+		if httpUpgrade {
+			wsOpts["v2ray-http-upgrade"] = true
 		}
 		applyWSEarlyData(wsOpts, queryParams)
 		node["ws-opts"] = wsOpts
 	} else if network == "grpc" {
 		grpcOpts := map[string]any{
-			"grpc-service-name": safeDecodeURIComponent(queryParams["serviceName"]),
+			"grpc-service-name": queryParams["serviceName"],
 		}
 		authority := queryParams["authority"]
 		if authority == "" {
@@ -771,18 +784,18 @@ func parseTrojanURL(uri string) (map[string]any, error) {
 			authority = queryParams["host"]
 		}
 		if authority != "" {
-			grpcOpts["_grpc-authority"] = safeDecodeURIComponent(authority)
+			grpcOpts["_grpc-authority"] = authority
 		}
 		node["grpc-opts"] = grpcOpts
 	} else if network == "h2" || network == "http" {
 		h2Opts := map[string]any{
-			"path": safeDecodeURIComponent(queryParams["path"]),
+			"path": queryParams["path"],
 		}
 		if h2Opts["path"] == "" {
 			h2Opts["path"] = "/"
 		}
 		if host := queryParams["host"]; host != "" {
-			h2Opts["host"] = []string{safeDecodeURIComponent(host)}
+			h2Opts["host"] = []string{host}
 		} else {
 			h2Opts["host"] = []string{}
 		}
@@ -872,11 +885,16 @@ func parseVlessURL(uri string) (map[string]any, error) {
 		// 统一成 Clash 的 h2，才能让 URI producer 再次输出时保持传输层参数不变。
 		network = "h2"
 	}
+	httpUpgrade := network == "httpupgrade"
+	if httpUpgrade {
+		// 与 URI 导出端约定一致，保留升级传输所需的 Host、path 和标记。
+		network = "ws"
+	}
 	node["network"] = network
 
 	// SNI/Servername (支持显式空字符串)
 	if sni, ok := queryParams["sni"]; ok {
-		node["servername"] = safeDecodeURIComponent(sni)
+		node["servername"] = sni
 	}
 
 	// Skip cert verify（统一别名）
@@ -910,15 +928,18 @@ func parseVlessURL(uri string) (map[string]any, error) {
 	// Transport options
 	if network == "ws" {
 		wsOpts := map[string]any{
-			"path": safeDecodeURIComponent(queryParams["path"]),
+			"path": queryParams["path"],
 		}
 		if wsOpts["path"] == "" {
 			wsOpts["path"] = "/"
 		}
 		if host := queryParams["host"]; host != "" {
-			wsOpts["headers"] = map[string]string{"Host": safeDecodeURIComponent(host)}
+			wsOpts["headers"] = map[string]string{"Host": host}
 		} else {
 			wsOpts["headers"] = map[string]string{}
+		}
+		if httpUpgrade {
+			wsOpts["v2ray-http-upgrade"] = true
 		}
 		applyWSEarlyData(wsOpts, queryParams)
 		node["ws-opts"] = wsOpts
@@ -928,7 +949,7 @@ func parseVlessURL(uri string) (map[string]any, error) {
 			serviceName = queryParams["path"]
 		}
 		grpcOpts := map[string]any{
-			"grpc-service-name": safeDecodeURIComponent(serviceName),
+			"grpc-service-name": serviceName,
 		}
 		authority := queryParams["authority"]
 		if authority == "" {
@@ -936,7 +957,7 @@ func parseVlessURL(uri string) (map[string]any, error) {
 			authority = queryParams["host"]
 		}
 		if authority != "" {
-			grpcOpts["_grpc-authority"] = safeDecodeURIComponent(authority)
+			grpcOpts["_grpc-authority"] = authority
 		}
 		if mode := queryParams["mode"]; mode != "" {
 			grpcOpts["_grpc-type"] = mode
@@ -947,26 +968,26 @@ func parseVlessURL(uri string) (map[string]any, error) {
 	} else if network == "tcp" && queryParams["headerType"] == "http" {
 		// TCP HTTP 伪装的 host 是 HTTP Host，不能与 TLS SNI 混为同一字段。
 		httpOpts := map[string]any{
-			"path": safeDecodeURIComponent(queryParams["path"]),
+			"path": queryParams["path"],
 		}
 		if httpOpts["path"] == "" {
 			httpOpts["path"] = "/"
 		}
 		if host := queryParams["host"]; host != "" {
-			httpOpts["headers"] = map[string]string{"Host": safeDecodeURIComponent(host)}
+			httpOpts["headers"] = map[string]string{"Host": host}
 		} else {
 			httpOpts["headers"] = map[string]string{}
 		}
 		node["http-opts"] = httpOpts
 	} else if network == "h2" || network == "http" {
 		h2Opts := map[string]any{
-			"path": safeDecodeURIComponent(queryParams["path"]),
+			"path": queryParams["path"],
 		}
 		if h2Opts["path"] == "" {
 			h2Opts["path"] = "/"
 		}
 		if host := queryParams["host"]; host != "" {
-			h2Opts["host"] = []string{safeDecodeURIComponent(host)}
+			h2Opts["host"] = []string{host}
 		} else {
 			h2Opts["host"] = []string{}
 		}
@@ -974,13 +995,13 @@ func parseVlessURL(uri string) (map[string]any, error) {
 	} else if network == "xhttp" {
 		node["network"] = "xhttp"
 		xhttpOpts := map[string]any{
-			"path": safeDecodeURIComponent(queryParams["path"]),
+			"path": queryParams["path"],
 		}
 		if xhttpOpts["path"] == "" {
 			xhttpOpts["path"] = "/"
 		}
 		if host := queryParams["host"]; host != "" {
-			xhttpOpts["headers"] = map[string]string{"Host": safeDecodeURIComponent(host)}
+			xhttpOpts["headers"] = map[string]string{"Host": host}
 		} else {
 			xhttpOpts["headers"] = map[string]string{}
 		}
@@ -1064,9 +1085,9 @@ func parseHysteriaGeneric(uri string, protocol string) (map[string]any, error) {
 
 	// SNI (支持显式空字符串)
 	if sni, ok := queryParams["sni"]; ok {
-		node["sni"] = safeDecodeURIComponent(sni)
+		node["sni"] = sni
 	} else if peer, ok := queryParams["peer"]; ok {
-		node["sni"] = safeDecodeURIComponent(peer)
+		node["sni"] = peer
 	}
 
 	// OBFS
@@ -1179,7 +1200,7 @@ func parseTuicURL(uri string) (map[string]any, error) {
 
 	// SNI (支持显式空字符串)
 	if sni, ok := queryParams["sni"]; ok {
-		node["sni"] = safeDecodeURIComponent(sni)
+		node["sni"] = sni
 	}
 	applyTlsSniFallback(node, "sni")
 
@@ -1267,9 +1288,9 @@ func parseAnytlsURL(uri string) (map[string]any, error) {
 
 	// SNI (支持显式空字符串)
 	if sni, ok := queryParams["sni"]; ok {
-		node["sni"] = safeDecodeURIComponent(sni)
+		node["sni"] = sni
 	} else if peer, ok := queryParams["peer"]; ok {
-		node["sni"] = safeDecodeURIComponent(peer)
+		node["sni"] = peer
 	}
 	applyTlsSniFallback(node, "sni")
 
@@ -1517,7 +1538,7 @@ func parseNaiveURL(uri string) (map[string]any, error) {
 	}
 
 	if sni := queryParams["sni"]; sni != "" {
-		node["sni"] = safeDecodeURIComponent(sni)
+		node["sni"] = sni
 	}
 	if queryParams["uot"] == "1" {
 		node["udp-over-tcp"] = true

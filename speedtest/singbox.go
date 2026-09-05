@@ -19,7 +19,7 @@ const (
 	// minSingBoxVersion 只表示运行时允许使用的最低兼容版本，不能随镜像升级自动抬高。
 	minSingBoxVersion = "1.14.0-beta.17"
 	// pinnedSingBoxVersion 表示 Docker 镜像固定携带的版本，可独立于最低兼容版本升级。
-	pinnedSingBoxVersion = "1.14.0-beta.17"
+	pinnedSingBoxVersion = "1.14.0"
 )
 
 var (
@@ -48,7 +48,7 @@ func singBoxVersion(bin string) string {
 	return matched[1]
 }
 
-// singBoxSupported 检查二进制是否达到当前 PoC 已验证的最低 beta 版本。
+// singBoxSupported 保留已验证的兼容下限，镜像升级正式版不强制用户替换显式指定的合格内核。
 func singBoxSupported(bin string) bool {
 	version := singBoxVersion(bin)
 	return version != "" && semanticVersionGTE(version, minSingBoxVersion)
@@ -174,7 +174,7 @@ func singBoxCandidatePaths() []string {
 	return candidates
 }
 
-// EnsureSingBox 定位 Snell v6 专用内核；Docker 镜像内已固定版本，不在运行时下载测试版。
+// EnsureSingBox 定位 Snell v6 专用内核；Docker 镜像内已固定版本，不在运行时下载内核。
 // 显式 SING_BOX_BIN 与 MIHOMO_BIN 一样采用失败关闭：候选里的 $MMWX_DATA_DIR/bin 是用户可写的
 // 数据卷，静默回退等于允许卷里的文件顶掉镜像自带的内核，而调用方只会看到一次普通的测速失败。
 func EnsureSingBox(_ context.Context) (string, error) {

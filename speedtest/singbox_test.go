@@ -161,17 +161,24 @@ func TestSemanticVersionGTE(t *testing.T) {
 
 func TestGeneratedConfigWithInstalledSingBox(t *testing.T) {
 	bin := installedTestSingBox(t)
-	content, err := buildSingBoxConfig(validSnellV6Proxy(), 19004)
-	if err != nil {
-		t.Fatalf("生成配置失败: %v", err)
-	}
-	workdir := t.TempDir()
-	configPath := filepath.Join(workdir, "config.json")
-	if err := os.WriteFile(configPath, content, 0600); err != nil {
-		t.Fatalf("写入测试配置失败: %v", err)
-	}
-	if err := checkSingBoxConfig(context.Background(), proxyRuntime{Core: coreSingBox, Bin: bin}, workdir, configPath, []string{testPSK}); err != nil {
-		t.Fatalf("官方 sing-box 配置校验失败: %v", err)
+	// 内核从测试版升级到正式版时逐个校验已支持的模式，避免只验证单个样本漏掉兼容变化。
+	for _, mode := range []string{"default", "unshaped", "unsafe-raw"} {
+		t.Run(mode, func(t *testing.T) {
+			proxy := validSnellV6Proxy()
+			proxy["mode"] = mode
+			content, err := buildSingBoxConfig(proxy, 19004)
+			if err != nil {
+				t.Fatalf("生成配置失败: %v", err)
+			}
+			workdir := t.TempDir()
+			configPath := filepath.Join(workdir, "config.json")
+			if err := os.WriteFile(configPath, content, 0600); err != nil {
+				t.Fatalf("写入测试配置失败: %v", err)
+			}
+			if err := checkSingBoxConfig(context.Background(), proxyRuntime{Core: coreSingBox, Bin: bin}, workdir, configPath, []string{testPSK}); err != nil {
+				t.Fatalf("官方 sing-box 配置校验失败: %v", err)
+			}
+		})
 	}
 }
 

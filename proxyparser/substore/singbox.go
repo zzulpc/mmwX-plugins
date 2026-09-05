@@ -102,7 +102,8 @@ func (p *SingboxProducer) Produce(proxies []Proxy, outputType string, opts *Prod
 			}
 		case "vmess":
 			network := GetString(proxy, "network")
-			if network == "" || network == "ws" || network == "grpc" || network == "h2" || network == "http" {
+			// URI 解析器会把省略的传输层补成 tcp，必须与 YAML 中省略 network 的节点等价。
+			if network == "" || network == "tcp" || network == "ws" || network == "grpc" || network == "h2" || network == "http" {
 				parsed, err = p.vmessParser(proxy)
 			} else {
 				err = fmt.Errorf("platform sing-box does not support proxy type: %s with network %s", proxyType, network)

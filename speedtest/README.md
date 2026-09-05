@@ -5,20 +5,21 @@
 测速任务后,用 [Mihomo](https://github.com/MetaCubeX/mihomo) 或 [sing-box](https://github.com/SagerNet/sing-box) 内核对指定节点下载测速,
 结果经同一连接回传。从而得到「你家这条网络 → 节点」的真实速度。
 
-## Snell v6 双内核 PoC
+## Snell v6 双内核分流
 
-当前 Mihomo 尚不能完成 Snell v6 测速，因此测速端按节点配置自动分流：
+截至 2026-09-05，Mihomo 最新正式版 1.19.30 仍会拒绝 `version: 6`，
+因此测速端继续按节点配置自动分流（见 [Mihomo 官方实现](https://github.com/MetaCubeX/mihomo/blob/v1.19.30/adapter/outbound/snell.go)）：
 
-- `type=snell` 且 `version=6`：使用 sing-box 1.14；
+- `type=snell` 且 `version=6`：使用 sing-box 1.14 正式版；
 - Snell v4/v5 及其他全部协议：继续使用 Mihomo，原有路径不变。
 
 这一版只承载现有 HTTP/HTTPS 测速所需的 TCP 流量，sing-box 出站固定为 `network: tcp`，
 暂不把 UDP 测试算作已支持。Snell v6 的 `default`、`unshaped`、`unsafe-raw` 三种 mode
 均按主控配置原样转换；`unsafe-raw` 缺少协议层加密，不建议使用。
 
-Dockerfile 固定使用 Mihomo `v1.19.30` 与 sing-box `v1.14.0-beta.17`；构建时按目标架构
-校验官方资产 SHA-256，容器运行期间不再下载代理内核。sing-box 仍是测试版，因此固定
-官方镜像清单摘要，不使用 `latest-testing`。第三方来源与许可证见
+Dockerfile 固定使用 Mihomo `v1.19.30` 与 sing-box `v1.14.0`；构建时按目标架构
+校验官方资产 SHA-256，并固定官方镜像清单摘要，容器运行期间不再下载代理内核。
+构建工具链固定为 Go 1.26.8，运行环境为 Alpine 3.24.1。第三方来源与许可证见
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)，对应源码见
 [`CORRESPONDING_SOURCE.md`](CORRESPONDING_SOURCE.md)。
 
@@ -81,18 +82,18 @@ $env:MMWX_DATA_DIR = "$env:LOCALAPPDATA\mmwx-speedtester"
 
 ## Docker 构建
 
-在本目录构建 PoC 镜像：
+在本目录构建镜像：
 
 ```bash
-docker build -t mmwx-speedtester:snell-v6-poc .
+docker build -t mmwx-speedtester:local .
 ```
 
 公开发行版发布到 `ghcr.io/zzulpc/mmwx-speedtester`。发布流程只接受
 `speedtest-vX.Y.Z` 格式的正式标签，并只生成完整版本标签与提交标签，不自动更新
-`latest`。`speedtest-v0.2.5` 对应：
+`latest`。当前源码版本为 0.2.6，以下获取方式在正式发布 `speedtest-v0.2.6` 后生效：
 
 ```bash
-docker pull ghcr.io/zzulpc/mmwx-speedtester:0.2.5
+docker pull ghcr.io/zzulpc/mmwx-speedtester:0.2.6
 ```
 
 镜像不包含主控地址、测速端名称、配对令牌或节点密钥。`MMWX_MASTER`、
@@ -145,6 +146,12 @@ go build ./...
 
 <details>
 <summary>更新日志</summary>
+
+### v0.2.6（待发布）
+- 将内置 sing-box 升级到 1.14.0 正式版，保留 Snell v6 双内核分流。
+- 将 Go 构建工具链升级到 1.26.8，容器运行环境升级到 Alpine 3.24.1，并同步固定摘要与对应源码。
+- 修复仅测延迟时全部失败仍回报成功，以及主控断线后旧测速任务继续执行的问题。
+- 安装脚本先在临时文件中下载与校验，通过后替换程序；失败时保留原有可用版本。
 
 ### v0.2.5 (2026-08-26)
 - 修复测速端安全、资源与发布边界

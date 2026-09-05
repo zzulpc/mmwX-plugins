@@ -6,18 +6,18 @@
 #     -e MMWX_SPEEDTEST_TOKEN=<token> \
 #     -e MMWX_SPEEDTEST_NAME=home-tester \
 #     -v mmwx-speedtester-data:/data \
-#     ghcr.io/zzulpc/mmwx-speedtester:0.2.5
+#     ghcr.io/zzulpc/mmwx-speedtester:0.2.6
 #
 # Mihomo 与 sing-box 都固定在镜像内；已有 /data 卷可继续挂载，但不再负责提供代理内核。
 # 容器运行期只需访问主控 WS 与测速目标，不需要连接 GitHub 下载内核。
 
 # ---- Snell v6 内核 ----
 # 固定官方多架构镜像的标签与清单摘要，避免 testing/latest 漂移。
-FROM ghcr.io/sagernet/sing-box:v1.14.0-beta.17@sha256:391edf5b1421d89106e14a7c76fde37355e243358d45532f7d58303889439104 AS singbox
+FROM ghcr.io/sagernet/sing-box:v1.14.0@sha256:4bed9332a0013fef72c31200a84e8fc0ed91a5ab2fe373a69f0acbbbbfbef3c5 AS singbox
 
 # ---- Mihomo 内核 ----
 # 下载阶段固定在构建机架构运行，但必须按 TARGETARCH 选择目标资产，避免跨架构镜像打入错误二进制。
-FROM --platform=$BUILDPLATFORM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS mihomo
+FROM --platform=$BUILDPLATFORM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS mihomo
 ARG TARGETOS
 ARG TARGETARCH
 RUN set -eux; \
@@ -41,17 +41,18 @@ RUN set -eux; \
     chmod 0555 /out/mihomo
 
 # ---- builder ----
-FROM golang:1.26-alpine@sha256:28d89ee9cc0ff9fec75c82ca201e6bf7fdf9a679d4b7b24dfa04f2bb766bb468 AS builder
+FROM golang:1.26.8-alpine3.24@sha256:ce864e7223ac17b1775e6fd0b4c0db580c2eb50e7953a427916379e4b92a1628 AS builder
 WORKDIR /src
 # 单独 cp go.mod/sum 让 mod download 缓存层稳定
 COPY go.mod go.sum ./
-RUN go mod download
+# 标签与摘要同时固定后仍验证实际工具链，防止更新其中一处时构建器版本悄悄落后。
+RUN test "$(go env GOVERSION)" = "go1.26.8" && go mod download
 COPY . .
 # -trimpath + -s -w 缩小 binary;CGO_ENABLED=0 全静态
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/mmwx-speedtester .
 
 # ---- runtime ----
-FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 # ca-certificates:主控 WSS 鉴权与 HTTPS 测速目标
 # tzdata:日志时间戳本地化(可选)
 RUN apk add --no-cache ca-certificates tzdata && \
@@ -76,7 +77,7 @@ RUN set -eu; \
     test "$mihomo_version" = "v1.19.30"; \
     sing_box_output="$(/usr/local/bin/sing-box version 2>&1)"; \
     sing_box_version_line="$(printf '%s\n' "$sing_box_output" | awk 'NR == 1 { print; exit }')"; \
-    test "$sing_box_version_line" = "sing-box version 1.14.0-beta.17"
+    test "$sing_box_version_line" = "sing-box version 1.14.0"
 WORKDIR /data
 VOLUME ["/data"]
 

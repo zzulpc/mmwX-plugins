@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # 固定 v4
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # 固定 v5
         with:
-          go-version: '1.26'
+          go-version: '1.26.8'
           cache: true
           cache-dependency-path: ${{ matrix.module }}/go.sum
       - name: 静态检查
@@ -33,3 +33,19 @@ jobs:
       - name: 竞争检测与测试
         working-directory: ${{ matrix.module }}
         run: go test ./... -race -count=1
+
+  install-windows:
+    name: 检查 Windows 安装替换
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # 固定 v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # 固定 v5
+        with:
+          go-version: '1.26.8'
+          cache: true
+          cache-dependency-path: speedtest/go.sum
+      # 文件锁行为必须在 Windows 验证；Linux 上通过替换测试不能证明正在运行的 exe 会被保留。
+      - name: 验证安装成功与失败时保留旧版
+        working-directory: speedtest
+        shell: pwsh
+        run: go test -run '^TestPowerShellInstaller原子安装$' -count=1 -v

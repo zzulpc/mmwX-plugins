@@ -765,6 +765,16 @@ func (p *URIProducer) encodeTrojan(proxy Proxy) (string, error) {
 				}
 				params.Set("mode", grpcType)
 			}
+		case "h2", "http":
+			if h2Opts := GetMap(proxy, "h2-opts"); h2Opts != nil {
+				// 与解析端的 H2 别名保持一致，兼容 URI 字符串与 YAML 列表容器。
+				if path := valueutil.FirstString(h2Opts["path"]); path != "" {
+					params.Set("path", path)
+				}
+				if host := valueutil.FirstString(h2Opts["host"]); host != "" {
+					params.Set("host", host)
+				}
+			}
 		}
 	}
 

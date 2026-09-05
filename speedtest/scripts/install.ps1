@@ -1,5 +1,5 @@
-# mmwx-speedtester Windows install & run script
-# Usage: .\install.ps1 -Master https://your-master-url -Token <token>
+# mmwx-speedtester Windows 安装与启动脚本。
+# 用法：.\install.ps1 -Master https://your-master-url -Token <token>
 param(
     [Parameter(Mandatory=$true)][string]$Master,
     [Parameter(Mandatory=$true)][string]$Token
@@ -9,7 +9,7 @@ $ErrorActionPreference = "Stop"
 $Repo = "zzulpc/mmwX-plugins"
 $BinaryName = "mmwx-speedtester"
 
-# Detect architecture
+# 发布资产只提供 64 位版本，必须先拒绝不支持的平台。
 $Arch = if ([Environment]::Is64BitOperatingSystem) {
     if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "amd64" }
 } else {
@@ -19,7 +19,7 @@ $Arch = if ([Environment]::Is64BitOperatingSystem) {
 $AssetName = "${BinaryName}-windows-${Arch}.exe"
 Write-Host "Platform: windows/${Arch}"
 
-# Get latest release
+# 二进制和摘要必须取自同一个 Release，避免发布更新期间版本混用。
 Write-Host "Fetching latest release..."
 $ReleaseUrl = "https://api.github.com/repos/${Repo}/releases/latest"
 $Release = Invoke-RestMethod -Uri $ReleaseUrl -Headers @{ "User-Agent" = "mmwx-installer" }
@@ -36,12 +36,22 @@ if (-not $ChecksumsAsset) {
     exit 1
 }
 
-# Download
+# 下载临时文件与正式文件同目录，避免跨卷移动破坏替换的原子性。
 $OutputPath = Join-Path $PWD "${BinaryName}.exe"
-$ChecksumsPath = [System.IO.Path]::GetTempFileName()
+$ChecksumsPath = $null
+$DownloadPath = $null
 try {
+    if (Test-Path -LiteralPath $OutputPath -PathType Container) {
+        throw "Install path is a directory: ${OutputPath}"
+    }
+    $CandidatePath = Join-Path $PWD ".${BinaryName}.$([Guid]::NewGuid().ToString('N')).download"
+    # CreateNew 保证只取得本次新建文件的所有权，极小概率重名时也不能删除已有文件。
+    $DownloadStream = [System.IO.File]::Open($CandidatePath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    $DownloadPath = $CandidatePath
+    $DownloadStream.Dispose()
+    $ChecksumsPath = [System.IO.Path]::GetTempFileName()
     Write-Host "Downloading ${AssetName}..."
-    Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $OutputPath
+    Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $DownloadPath
     Invoke-WebRequest -Uri $ChecksumsAsset.browser_download_url -OutFile $ChecksumsPath
 
     $ExpectedHash = $null
@@ -58,26 +68,41 @@ try {
         throw "Checksum for ${AssetName} not found or invalid."
     }
 
-    $ActualHash = (Get-FileHash -Path $OutputPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $ActualHash = (Get-FileHash -LiteralPath $DownloadPath -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($ActualHash -ne $ExpectedHash) {
         throw "Checksum mismatch for ${AssetName}."
     }
+    try {
+        if ([System.IO.File]::Exists($OutputPath)) {
+            # Windows 正在运行的程序通常被锁定；Replace 失败时保留旧文件，禁止先删后移。
+            # PowerShell 会把普通 $null 绑定为空字符串；备份路径必须传真正的 .NET null。
+            [System.IO.File]::Replace($DownloadPath, $OutputPath, [NullString]::Value)
+        } else {
+            # 首次安装只接受目标不存在；并发出现新文件时失败，不覆盖未验证的目标。
+            [System.IO.File]::Move($DownloadPath, $OutputPath)
+        }
+    }
+    catch {
+        throw "Failed to replace ${OutputPath}; the previous binary was preserved. Stop the running tester and retry. $($_.Exception.Message)"
+    }
+    $DownloadPath = $null
     Write-Host "Saved to: ${OutputPath}"
 }
 catch {
-    if (Test-Path -LiteralPath $OutputPath) {
-        Remove-Item -LiteralPath $OutputPath -Force
-    }
     Write-Error $_.Exception.Message
     exit 1
 }
 finally {
-    if (Test-Path -LiteralPath $ChecksumsPath) {
+    # 无论在哪一步失败，只清理本次创建的下载和摘要临时文件。
+    if ($DownloadPath -and (Test-Path -LiteralPath $DownloadPath)) {
+        Remove-Item -LiteralPath $DownloadPath -Force
+    }
+    if ($ChecksumsPath -and (Test-Path -LiteralPath $ChecksumsPath)) {
         Remove-Item -LiteralPath $ChecksumsPath -Force
     }
 }
 
-# Run
+# 仅在完整安装成功后启动，退出后恢复调用方已有的配对环境变量。
 Write-Host ""
 Write-Host "========================================"
 Write-Host "Master: ${Master}"

@@ -181,7 +181,15 @@ func RunNodeTest(ctx context.Context, runtimeInfo proxyRuntime, clashConfigJSON 
 	// LatencyOnly:只测真连接延迟(Cloudflare 204 多采样),不跑下载
 	if opts.LatencyOnly {
 		latency := measureLatencyCloudflare(ctx, mixedPort, cfLatencySamples)
-		return Result{LatencyMs: latency, EgressIP: egressIP}, nil
+		result := Result{LatencyMs: latency, EgressIP: egressIP}
+		// 没有有效样本或任务已经取消时必须回报失败，否则主控会把 -1 毫秒当成成功结果。
+		if err := ctx.Err(); err != nil {
+			return result, fmt.Errorf("延迟测速被取消: %w", err)
+		}
+		if latency < 0 {
+			return result, fmt.Errorf("延迟测速失败: 未获得有效延迟样本")
+		}
+		return result, nil
 	}
 
 	latency := measureLatency(ctx, mixedPort)

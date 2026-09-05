@@ -21,14 +21,14 @@
 
 对应关系如下：
 
-- 版本：`v1.14.0-beta.17`
-- 完整提交：`c82b9b8dc92e1495968a1e0835644e4ad6fc303b`
-- 官方容器清单摘要：`sha256:391edf5b1421d89106e14a7c76fde37355e243358d45532f7d58303889439104`
-- 对应源码：<https://github.com/SagerNet/sing-box/archive/refs/tags/v1.14.0-beta.17.tar.gz>
-- 本次固定源码包 SHA-256：`061cb9769a9d117d8b100081cf721236f5b26f17d5ab6b28db8de9c76fa3a7d4`
+- 版本：`v1.14.0`
+- 完整提交：`0b8995879f29a9b98ee027bc17b75e101445b238`
+- 官方容器清单摘要：`sha256:4bed9332a0013fef72c31200a84e8fc0ed91a5ab2fe373a69f0acbbbbfbef3c5`
+- 对应源码：<https://github.com/SagerNet/sing-box/archive/refs/tags/v1.14.0.tar.gz>
+- 本次固定源码包 SHA-256：`87baf6852e37941cbe40bdd94bec81c957c88a56751cecd6bbf0e6108bc69398`
 
 每个正式 GitHub Release 都会同时附带文件
-`sing-box-v1.14.0-beta.17-source.tar.gz`。发布流程会先核对上述 SHA-256，再上传同一份源码包；
+`sing-box-v1.14.0-source.tar.gz`。发布流程会先核对上述 SHA-256，再上传同一份源码包；
 如果上游归档内容发生变化，发布会失败，而不会悄悄附带未经核验的源码。
 
 该源码包包含构建 sing-box 所需的源文件、模块依赖声明与上游构建配置。只要本项目继续提供

@@ -1,6 +1,6 @@
 # 第三方组件说明
 
-本 PoC 容器包含以下独立运行的第三方程序：
+本容器包含以下独立运行的第三方程序：
 
 ## Mihomo
 
@@ -22,10 +22,10 @@
 ## sing-box
 
 - 项目：SagerNet/sing-box
-- 固定版本：`v1.14.0-beta.17`
-- 固定源码提交：`c82b9b8dc92e1495968a1e0835644e4ad6fc303b`
-- 容器清单摘要：`sha256:391edf5b1421d89106e14a7c76fde37355e243358d45532f7d58303889439104`
-- 上游源码：<https://github.com/SagerNet/sing-box/tree/v1.14.0-beta.17>
+- 固定版本：`v1.14.0`
+- 固定源码提交：`0b8995879f29a9b98ee027bc17b75e101445b238`
+- 容器清单摘要：`sha256:4bed9332a0013fef72c31200a84e8fc0ed91a5ab2fe373a69f0acbbbbfbef3c5`
+- 上游源码：<https://github.com/SagerNet/sing-box/tree/v1.14.0>
 - 许可证：GNU General Public License v3.0 or later
 - 上游许可声明：[`LICENSES/sing-box-LICENSE.txt`](LICENSES/sing-box-LICENSE.txt)
 - GPLv3 完整正文：[`LICENSES/GPL-3.0.txt`](LICENSES/GPL-3.0.txt)

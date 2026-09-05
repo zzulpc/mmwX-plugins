@@ -1,6 +1,6 @@
 #!/bin/bash
-# mmwx-speedtester install & run script
-# Usage: curl -fsSL <url>/install.sh | bash -s -- -master https://your-master-url -token <token>
+# mmwx-speedtester 安装与启动脚本。
+# 用法：curl -fsSL <url>/install.sh | bash -s -- -master https://your-master-url -token <token>
 set -euo pipefail
 
 REPO="zzulpc/mmwX-plugins"
@@ -10,17 +10,21 @@ ASSET_NAME=""
 DOWNLOAD_URL=""
 CHECKSUMS_URL=""
 CHECKSUM_FILE=""
+DOWNLOAD_FILE=""
 BINARY_PATH=""
 
-# 无论校验在哪一步退出，都清理下载到临时目录的校验清单。
-cleanup_checksum_file() {
+# 只清理本次创建的临时文件；下载或校验失败时，原有程序必须保持可用。
+cleanup_install_files() {
   if [ -n "${CHECKSUM_FILE}" ]; then
     rm -f -- "${CHECKSUM_FILE}"
   fi
+  if [ -n "${DOWNLOAD_FILE}" ]; then
+    rm -f -- "${DOWNLOAD_FILE}"
+  fi
 }
-trap cleanup_checksum_file EXIT
+trap cleanup_install_files EXIT
 
-# Parse arguments
+# 解析主控配对参数。
 MASTER=""
 TOKEN=""
 
@@ -37,7 +41,7 @@ if [ -z "$MASTER" ] || [ -z "$TOKEN" ]; then
   exit 1
 fi
 
-# Detect OS and architecture
+# 发布资产按操作系统与架构区分，必须拒绝未提供二进制的平台。
 detect_platform() {
   OS="$(uname -s | tr 'A-Z' 'a-z')"
   ARCH="$(uname -m)"
@@ -56,7 +60,7 @@ detect_platform() {
   esac
 }
 
-# Get download URL from latest release
+# 二进制和校验清单必须来自同一个 Release，避免发布更新期间版本混用。
 get_download_url() {
   ASSET_NAME="${BINARY_NAME}-${OS}-${ARCH}"
   if [ "$OS" = "windows" ]; then
@@ -95,7 +99,6 @@ verify_checksum() {
 
   CHECKSUM_FILE="$(mktemp)"
   if ! curl -fsSL -o "$CHECKSUM_FILE" "$CHECKSUMS_URL"; then
-    rm -f -- "$output"
     echo "Failed to download checksums.txt"
     exit 1
   fi
@@ -111,7 +114,6 @@ verify_checksum() {
     }
   ' "$CHECKSUM_FILE")
   if [[ ! "$expected_hash" =~ ^[0-9a-f]{64}$ ]]; then
-    rm -f -- "$output"
     echo "Checksum for ${ASSET_NAME} not found or invalid."
     exit 1
   fi
@@ -121,13 +123,11 @@ verify_checksum() {
   elif command -v shasum >/dev/null 2>&1; then
     actual_hash=$(shasum -a 256 "$output" | awk '{print tolower($1)}')
   else
-    rm -f -- "$output"
     echo "Neither sha256sum nor shasum is available."
     exit 1
   fi
 
   if [ "$actual_hash" != "$expected_hash" ]; then
-    rm -f -- "$output"
     echo "Checksum mismatch for ${ASSET_NAME}."
     exit 1
   fi
@@ -136,25 +136,34 @@ verify_checksum() {
   CHECKSUM_FILE=""
 }
 
-# Download binary
+# 下载文件与正式路径位于同一目录，校验和权限设置成功后才能原子替换旧版。
 download_binary() {
   local output="${INSTALL_DIR}/${BINARY_NAME}"
   if [ "$OS" = "windows" ]; then
     output="${output}.exe"
   fi
 
+  if [ -d "$output" ]; then
+    echo "Install path is a directory: ${output}"
+    exit 1
+  fi
+  DOWNLOAD_FILE="$(mktemp "${INSTALL_DIR}/.${BINARY_NAME}.XXXXXX")"
   echo "Downloading ${BINARY_NAME} (${OS}/${ARCH})..."
-  curl -fsSL -o "$output" "$DOWNLOAD_URL" || {
-    rm -f -- "$output"
+  curl -fsSL -o "$DOWNLOAD_FILE" "$DOWNLOAD_URL" || {
     echo "Download failed"; exit 1
   }
-  verify_checksum "$output"
-  chmod +x "$output"
+  verify_checksum "$DOWNLOAD_FILE"
+  chmod +x "$DOWNLOAD_FILE"
+  if ! mv -f -- "$DOWNLOAD_FILE" "$output"; then
+    echo "Failed to replace ${output}; the previous binary was preserved. Stop the running tester and retry."
+    exit 1
+  fi
+  DOWNLOAD_FILE=""
   echo "Saved to: ${output}"
   BINARY_PATH="$output"
 }
 
-# Run
+# 仅在完整安装成功后启动，并通过环境变量向子进程传递令牌。
 run_binary() {
   echo ""
   echo "========================================"

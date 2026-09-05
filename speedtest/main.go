@@ -240,8 +240,8 @@ func connectAndServeWithIPv6Check(wsURL, name string, onConnected func(), ipv6Ch
 		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		data, _ := json.Marshal(m)
 		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
-			// 写失败已经能证明这条连接不可用，立即取消它派发的 probe，
-			// 不必再等读超时到期才释放全局拨测资源。
+			// 写失败已经能证明这条连接不可用，立即取消它派发的任务，
+			// 不必再等读超时到期才释放测速与拨测资源。
 			cancelConnection()
 			return err
 		}
@@ -281,7 +281,7 @@ func connectAndServeWithIPv6Check(wsURL, name string, onConnected func(), ipv6Ch
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			// 先取消再返回，确保这条连接派发的 probe 不会在函数退出边缘继续占槽或回传旧结果。
+			// 先取消再返回，确保这条连接派发的任务不会在函数退出边缘继续占槽或回传旧结果。
 			cancelConnection()
 			return err
 		}
@@ -293,7 +293,7 @@ func connectAndServeWithIPv6Check(wsURL, name string, onConnected func(), ipv6Ch
 		}
 		switch msg.Type {
 		case "run":
-			dispatchRunJob(msg, send)
+			dispatchRunJob(connectionCtx, msg, send)
 		case "probe":
 			dispatchProbeJob(connectionCtx, msg, send)
 		}
@@ -301,9 +301,14 @@ func connectAndServeWithIPv6Check(wsURL, name string, onConnected func(), ipv6Ch
 	}
 }
 
-// dispatchRunJob 从收到消息时就启动超时，并用非阻塞信号量拒绝超出容量的任务。
-func dispatchRunJob(job wsMsg, send func(wsMsg) error) {
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestDuration+30*time.Second)
+// dispatchRunJob 从收到消息时就启动超时，并继承连接取消；断线后的结果无法回传，
+// 不应让旧任务继续占用带宽。非阻塞信号量仍拒绝超出容量的任务。
+func dispatchRunJob(parentCtx context.Context, job wsMsg, send func(wsMsg) error) {
+	ctx, cancel := context.WithTimeout(parentCtx, defaultTestDuration+30*time.Second)
+	if ctx.Err() != nil {
+		cancel()
+		return
+	}
 	select {
 	case runJobSlots <- struct{}{}:
 		go func() {

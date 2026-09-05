@@ -9,6 +9,24 @@ import (
 	"testing"
 )
 
+// 发布二进制和容器必须使用同一补丁工具链，否则仅检查 go.mod 的最低版本会漏掉构建差异。
+func TestBuildToolchainVersions跨文件一致(t *testing.T) {
+	dockerfile := readSpeedtestFile(t, "Dockerfile")
+	pattern := regexp.MustCompile(`(?m)^FROM golang:([0-9]+\.[0-9]+\.[0-9]+)-alpine[0-9.]+@sha256:[0-9a-f]{64} AS builder$`)
+	matched := pattern.FindStringSubmatch(dockerfile)
+	if len(matched) != 2 {
+		t.Fatal("Docker builder 必须固定完整 Go 补丁版本、Alpine 分支与镜像摘要")
+	}
+	goVersion := matched[1]
+	assertCapturedVersions(t, "Dockerfile 实际 Go 版本检查", dockerfile,
+		`(?m)^RUN test "\$\(go env GOVERSION\)" = "go([0-9]+\.[0-9]+\.[0-9]+)" && go mod download$`, goVersion, 1)
+	for name, count := range map[string]int{"ci.yml": 2, "speedtest.yml": 1} {
+		workflow := readSpeedtestFile(t, filepath.Join("..", ".github", "workflows", name))
+		assertCapturedVersions(t, name+" Go 工具链", workflow,
+			`(?m)^[ \t]+go-version: '([0-9]+\.[0-9]+\.[0-9]+)'[ \t]*$`, goVersion, count)
+	}
+}
+
 // TestPinnedKernelVersions跨文件一致逐项解析会真正影响发布产物的字段：Docker 构建来源与
 // 运行期检查、workflow 对应源码版本，以及三份用户可见文档。不能只查 Contains；旧版本若
 // 留在第二个架构资产、下载 URL 或源码包文件名里，也必须让测试失败。
