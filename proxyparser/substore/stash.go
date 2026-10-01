@@ -260,19 +260,8 @@ func (p *StashProducer) Produce(proxies []Proxy, outputType string, opts *Produc
 
 		// WireGuard transformations
 		if proxyType == "wireguard" {
-			keepalive := GetInt(transformed, "keepalive")
-			if keepalive == 0 {
-				keepalive = GetInt(transformed, "persistent-keepalive")
-			}
-			transformed["keepalive"] = keepalive
-			transformed["persistent-keepalive"] = keepalive
-
-			presharedKey := GetString(transformed, "preshared-key")
-			if presharedKey == "" {
-				presharedKey = GetString(transformed, "pre-shared-key")
-			}
-			transformed["preshared-key"] = presharedKey
-			transformed["pre-shared-key"] = presharedKey
+			// 只在非零 / 非空时输出 keepalive 与 psk(见 normalizeWireGuardOptionalFields)
+			normalizeWireGuardOptionalFields(transformed)
 		}
 
 		// Snell transformations
@@ -868,6 +857,10 @@ func (p *StashProducer) isSupportedType(proxyType string) bool {
 		"trojan", "tuic", "vless", "wireguard",
 		"hysteria", "hysteria2", "ssh", "juicity", "anytls",
 		"tailscale", "trusttunnel",
+		// Stash 已支持 mieru;此前不在白名单,订阅转 Stash 时这类节点被静默丢弃。
+		"mieru",
+		// MASQUE:上游 0dc202e7(2026-08-11)加入。同理,不在白名单会被静默丢掉。
+		"masque",
 	}
 
 	for _, t := range supportedTypes {

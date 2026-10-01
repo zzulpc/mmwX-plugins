@@ -8,6 +8,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // proxyCore 表示单次测速任务实际使用的代理内核。
@@ -73,8 +74,13 @@ func selectProxyCoreJSON(raw string) (proxyCore, error) {
 	return selectProxyCore(proxy)
 }
 
+// 内核定位、版本检查和必要下载共用此上限，不能按 PATH 候选逐次延长任务。
+const kernelPrepareTimeout = 15 * time.Second
+
 // resolveProxyRuntime 只定位本次任务需要的内核，Snell v6 不再依赖 Mihomo 预热结果。
 func resolveProxyRuntime(ctx context.Context, raw string) (proxyRuntime, error) {
+	ctx, cancel := context.WithTimeout(ctx, kernelPrepareTimeout)
+	defer cancel()
 	core, err := selectProxyCoreJSON(raw)
 	if err != nil {
 		return proxyRuntime{}, err

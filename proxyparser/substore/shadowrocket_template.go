@@ -75,15 +75,33 @@ func (p *ShadowrocketTemplateProducer) produceFullConfig(proxies []Proxy, opts *
 	sb.WriteString("\n")
 
 	// [Proxy]
-	sb.WriteString(p.generateProxies(proxies, opts))
+	proxySection, outputNames := p.generateProxies(proxies, opts)
+	sb.WriteString(proxySection)
 	sb.WriteString("\n")
 
+	// 不支持的节点(WireGuard、其它写成注释的类型、被过滤的)没有输出,
+	// 组和规则里指向它们的名字要一并清理(见 policy_prune.go)。
+	inputNames := make([]string, 0, len(proxies))
+	for _, proxy := range proxies {
+		inputNames = append(inputNames, GetString(proxy, "name"))
+	}
+	groups := shadowrocketProxyGroups(opts.FullConfig)
+	groupRefs := make([]policyGroupMembers, len(groups))
+	for i, g := range groups {
+		groupRefs[i] = policyGroupMembers{Name: GetString(g, "name"), Members: GetStringSlice(g, "proxies")}
+	}
+	pruned := prunePolicyGroups(groupRefs, inputNames, outputNames)
+
 	// [Proxy Group]
-	sb.WriteString(p.generateProxyGroups(opts))
+	sb.WriteString(p.generateProxyGroups(groups, pruned))
 	sb.WriteString("\n")
 
 	// [Rule]
-	sb.WriteString(p.generateRules(opts))
+	rules, err := p.generateRules(opts, pruned.Dangling)
+	if err != nil {
+		return "", err
+	}
+	sb.WriteString(rules)
 	sb.WriteString("\n")
 
 	// [Host]
@@ -166,12 +184,13 @@ func (p *ShadowrocketTemplateProducer) extractIPv6Config(fullConfig map[string]i
 	return false
 }
 
-// generateProxies 生成 [Proxy] 部分
-func (p *ShadowrocketTemplateProducer) generateProxies(proxies []Proxy, opts *ProduceOptions) string {
+// generateProxies 生成 [Proxy] 部分,同时返回实际输出了的节点名(写成注释的不算)
+func (p *ShadowrocketTemplateProducer) generateProxies(proxies []Proxy, opts *ProduceOptions) (string, map[string]bool) {
 	var sb strings.Builder
 	sb.WriteString("[Proxy]\n")
 	sb.WriteString("# 节点配置\n")
 
+	outputNames := make(map[string]bool)
 	transformed := p.transformProxies(proxies, opts)
 
 	for _, proxy := range transformed {
@@ -191,10 +210,13 @@ func (p *ShadowrocketTemplateProducer) generateProxies(proxies []Proxy, opts *Pr
 		if proxyLine != "" {
 			sb.WriteString(proxyLine)
 			sb.WriteString("\n")
+			if !strings.HasPrefix(proxyLine, "#") {
+				outputNames[name] = true
+			}
 		}
 	}
 
-	return sb.String()
+	return sb.String(), outputNames
 }
 
 // formatProxyLine 将节点转换为 Shadowrocket 单行格式
@@ -436,9 +458,10 @@ func (p *ShadowrocketTemplateProducer) formatProxyLine(proxy Proxy) string {
 		}
 
 	case "wireguard":
-		// WireGuard 配置较复杂，记录警告
-		log.Printf("[Shadowrocket] WireGuard节点 '%s' 可能需要手动配置", name)
-		return fmt.Sprintf("# WireGuard节点需要手动配置: %s", name)
+		// conf 格式不输出 WG:直接剔除,不留「需要手动配置」的注释 —— 注释里没有密钥,
+		// 用户也配不出来;组 / 规则里指向它的名字由 policy_prune 一并清理。
+		log.Printf("[Shadowrocket] 不支持 WireGuard 节点,已剔除: %s", name)
+		return ""
 
 	default:
 		log.Printf("[Shadowrocket] 不支持的节点类型: %s (%s)", proxyType, name)
@@ -448,21 +471,45 @@ func (p *ShadowrocketTemplateProducer) formatProxyLine(proxy Proxy) string {
 	return strings.Join(params, ",")
 }
 
-// generateProxyGroups 生成 [Proxy Group] 部分
-func (p *ShadowrocketTemplateProducer) generateProxyGroups(opts *ProduceOptions) string {
+// shadowrocketProxyGroups 取完整配置里的 proxy-groups(只要映射形式的条目)
+func shadowrocketProxyGroups(fullConfig map[string]interface{}) []map[string]interface{} {
+	var groups []map[string]interface{}
+	if proxyGroups, ok := fullConfig["proxy-groups"].([]interface{}); ok {
+		for _, group := range proxyGroups {
+			if groupMap, ok := group.(map[string]interface{}); ok {
+				groups = append(groups, groupMap)
+			}
+		}
+	}
+	return groups
+}
+
+// generateProxyGroups 生成 [Proxy Group] 部分。pruned 与 groups 一一对应:
+// 被剔空的组整组不输出,其余组用剔除悬空名字后的成员。
+func (p *ShadowrocketTemplateProducer) generateProxyGroups(groups []map[string]interface{}, pruned *policyPruneResult) string {
 	var sb strings.Builder
 	sb.WriteString("[Proxy Group]\n")
 	sb.WriteString("# 代理分组\n")
 
-	if proxyGroups, ok := opts.FullConfig["proxy-groups"].([]interface{}); ok {
-		for _, group := range proxyGroups {
-			if groupMap, ok := group.(map[string]interface{}); ok {
-				groupLine := p.formatProxyGroupLine(groupMap)
-				if groupLine != "" {
-					sb.WriteString(groupLine)
-					sb.WriteString("\n")
-				}
-			}
+	for i, groupMap := range groups {
+		if pruned.Removed[GetString(groupMap, "name")] {
+			continue
+		}
+		// 浅拷贝后替换成员,不改调用方的完整配置
+		group := make(map[string]interface{}, len(groupMap))
+		for k, v := range groupMap {
+			group[k] = v
+		}
+		members := make([]interface{}, 0, len(pruned.Members[i]))
+		for _, m := range pruned.Members[i] {
+			members = append(members, m)
+		}
+		group["proxies"] = members
+
+		groupLine := p.formatProxyGroupLine(group)
+		if groupLine != "" {
+			sb.WriteString(groupLine)
+			sb.WriteString("\n")
 		}
 	}
 
@@ -528,8 +575,8 @@ func (p *ShadowrocketTemplateProducer) formatProxyGroupLine(group map[string]int
 	return strings.Join(parts, ",")
 }
 
-// generateRules 生成 [Rule] 部分
-func (p *ShadowrocketTemplateProducer) generateRules(opts *ProduceOptions) string {
+// generateRules 对悬空目标明确报错，不能把用户路由静默改成 DIRECT。
+func (p *ShadowrocketTemplateProducer) generateRules(opts *ProduceOptions, dangling func(string) bool) (string, error) {
 	var sb strings.Builder
 	sb.WriteString("[Rule]\n")
 	sb.WriteString("# 规则配置\n")
@@ -548,26 +595,30 @@ func (p *ShadowrocketTemplateProducer) generateRules(opts *ProduceOptions) strin
 		}
 	}
 
-	// 处理 rules
-	if rules, ok := opts.FullConfig["rules"].([]interface{}); ok {
-		for _, rule := range rules {
-			if ruleStr, ok := rule.(string); ok {
-				ruleLine := p.formatRuleLine(ruleStr, ruleProviders)
-				if ruleLine != "" {
-					sb.WriteString(ruleLine)
-					sb.WriteString("\n")
-				}
-			}
+	// YAML 的 []any 和调用方的 []string 都要保留，不能误判成没有规则。
+	hasRules := false
+	for _, rule := range GetStringSlice(opts.FullConfig, "rules") {
+		ruleLine := p.formatRuleLine(rule, ruleProviders)
+		if err := validateRulePolicy(ruleLine, dangling); err != nil {
+			return "", err
+		}
+		if ruleLine != "" {
+			sb.WriteString(ruleLine)
+			sb.WriteString("\n")
+			hasRules = true
 		}
 	}
 
 	// 如果没有规则，添加默认规则
-	if len(sb.String()) < 50 {
+	if !hasRules {
 		sb.WriteString("GEOIP,CN,DIRECT\n")
+		if err := validateRulePolicy("FINAL,PROXY", dangling); err != nil {
+			return "", err
+		}
 		sb.WriteString("FINAL,PROXY\n")
 	}
 
-	return sb.String()
+	return sb.String(), nil
 }
 
 // formatRuleLine 格式化规则行
@@ -725,17 +776,8 @@ func (p *ShadowrocketTemplateProducer) transformProxies(proxies []Proxy, opts *P
 
 		// WireGuard transformations
 		if proxyType == "wireguard" {
-			// Keepalive
-			if !IsPresent(transformed, "keepalive") && IsPresent(transformed, "persistent-keepalive") {
-				transformed["keepalive"] = GetInt(transformed, "persistent-keepalive")
-			}
-			transformed["persistent-keepalive"] = GetInt(transformed, "keepalive")
-
-			// Preshared key
-			if !IsPresent(transformed, "preshared-key") && IsPresent(transformed, "pre-shared-key") {
-				transformed["preshared-key"] = GetString(transformed, "pre-shared-key")
-			}
-			transformed["pre-shared-key"] = GetString(transformed, "preshared-key")
+			// Keepalive / preshared key:只在非零 / 非空时输出(见 normalizeWireGuardOptionalFields)
+			normalizeWireGuardOptionalFields(transformed)
 		}
 
 		// Snell transformations

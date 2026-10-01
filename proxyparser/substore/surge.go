@@ -38,24 +38,44 @@ func (p *SurgeProducer) Produce(proxies []Proxy, outputType string, opts *Produc
 		opts = &ProduceOptions{}
 	}
 
-	var result []string
+	// 先记下实际输出了哪些节点:dialer-proxy 指向被跳过的节点(WG / VLESS 等)时,
+	// underlying-proxy 就是悬空引用,Surge 拒载。口径同 policy_prune.go:只认「输入里有、
+	// 却没输出」的名字,不认识的名字(模板里的策略组)原样保留。
+	type surgeLine struct{ line, dialer string }
+	var produced []surgeLine
+	inputNames := make([]string, 0, len(proxies))
+	outputNames := make(map[string]bool, len(proxies))
 	for _, proxy := range proxies {
-		line, err := p.ProduceOne(proxy, outputType, opts)
-
-		// convert dailer-proxy to underlying-proxy
-		dailerProxy := GetString(proxy, "dialer-proxy")
-		if dailerProxy != "" {
-			line += fmt.Sprintf(", underlying-proxy=%s", dailerProxy)
-		}
-
+		// 取原名:ProduceOne 会清洗名字里的 = 和 ,,dialer-proxy 引用的是原名
+		name := GetString(proxy, "name")
+		inputNames = append(inputNames, name)
+		renderProxy, dialer, err := prepareSurgeChain(proxy)
 		if err != nil {
-			if !opts.IncludeUnsupportedProxy {
-				continue
-			}
+			return nil, err
 		}
-		if line != "" {
-			result = append(result, line)
+		line, err := p.ProduceOne(renderProxy, outputType, opts)
+		if err != nil && !opts.IncludeUnsupportedProxy {
+			continue
 		}
+		if line == "" {
+			continue
+		}
+		outputNames[name] = true
+		produced = append(produced, surgeLine{line: line, dialer: dialer})
+	}
+	pruned := prunePolicyGroups(nil, inputNames, outputNames)
+
+	var result []string
+	for _, l := range produced {
+		line := l.line
+		// convert dailer-proxy to underlying-proxy
+		if l.dialer != "" && pruned.Dangling(l.dialer) {
+			return nil, fmt.Errorf("前置代理 %q 未输出，无法保留代理链", l.dialer)
+		}
+		if l.dialer != "" {
+			line += fmt.Sprintf(", underlying-proxy=%s", l.dialer)
+		}
+		result = append(result, line)
 	}
 
 	if outputType == "internal" {
@@ -67,6 +87,24 @@ func (p *SurgeProducer) Produce(proxies []Proxy, outputType string, opts *Produc
 		output += line + "\n"
 	}
 	return output, nil
+}
+
+// prepareSurgeChain 统一两种入口的前置代理字段，由外层追加一次；否则部分协议会漏链或重复写链。
+func prepareSurgeChain(proxy Proxy) (Proxy, string, error) {
+	dialer, underlying := GetString(proxy, "dialer-proxy"), GetString(proxy, "underlying-proxy")
+	if dialer != "" && underlying != "" && dialer != underlying {
+		return nil, "", fmt.Errorf("节点 %q 的两种前置代理字段冲突", GetString(proxy, "name"))
+	}
+	if dialer == "" {
+		dialer = underlying
+	}
+	out := make(Proxy, len(proxy))
+	for key, value := range proxy {
+		if key != "dialer-proxy" && key != "underlying-proxy" {
+			out[key] = value
+		}
+	}
+	return out, dialer, nil
 }
 
 // ProduceOne converts a single proxy to Surge format
@@ -117,6 +155,10 @@ func (p *SurgeProducer) ProduceOne(proxy Proxy, outputType string, opts *Produce
 		return p.hysteria2(proxy, includeUnsupported)
 	case "ssh":
 		return p.ssh(proxy)
+	case "trusttunnel":
+		return p.trustTunnel(proxy)
+	case "masque-surge":
+		return p.masqueSurge(proxy)
 	case "wireguard":
 		if includeUnsupported {
 			return p.wireguard(proxy)
@@ -246,6 +288,11 @@ func (p *SurgeProducer) vmess(proxy Proxy, includeUnsupported bool) (string, err
 		GetInt(proxy, "port")))
 
 	result.AppendIfPresent(`,username=%s`, "uuid")
+	// encrypt-method 从前整个漏掉了(JS 侧一直在写)。auto 按 JS 的约定不输出,
+	// 交给 Surge 自己挑;其余按它认的拼法写出来。
+	if m := surgeFormatVmessEncryptMethod(GetString(proxy, "cipher")); m != "" {
+		result.Append(fmt.Sprintf(",encrypt-method=%s", m))
+	}
 	p.appendIPVersion(result, proxy)
 	p.appendCommonOptions(result, proxy)
 	p.handleTransport(result, proxy, includeUnsupported)
@@ -347,6 +394,13 @@ func (p *SurgeProducer) snell(proxy Proxy) (string, error) {
 
 	result.AppendIfPresent(`,version=%d`, "version")
 	result.AppendIfPresent(`,psk=%s`, "psk")
+	// Snell v6 的传输模式(default / unshaped / unsafe-raw)。**只有 v6 有这个参数** ——
+	// 与 Sub-Store 上游一致(`if (Number(proxy.version) === 6)`)。v4/v5 的 mode 在
+	// obfs-opts.mode 里、含义是混淆方式,把它输出到顶层是另一回事。
+	// 漏掉时 Surge 只能按默认的 default 跑,用户在面板里选的 unshaped 不生效。
+	if GetInt(proxy, "version") == 6 {
+		result.AppendIfPresent(`,mode=%s`, "mode")
+	}
 	p.appendIPVersion(result, proxy)
 	p.appendCommonOptions(result, proxy)
 
@@ -571,10 +625,14 @@ func (p *SurgeProducer) wireguardSurge(proxy Proxy) (string, error) {
 }
 
 func (p *SurgeProducer) hysteria2(proxy Proxy, includeUnsupported bool) (string, error) {
-	// Check obfs support
+	// obfs:Surge 现在两种都收(上游 9405ac6f 加的 gecko),字段名各不相同。
+	obfsPasswordField := map[string]string{
+		"salamander": "salamander-password",
+		"gecko":      "gecko-password",
+	}[GetString(proxy, "obfs")]
 	if includeUnsupported {
-		if IsPresent(proxy, "obfs-password") && GetString(proxy, "obfs") != "salamander" {
-			return "", fmt.Errorf("only salamander obfs is supported")
+		if IsPresent(proxy, "obfs-password") && obfsPasswordField == "" {
+			return "", fmt.Errorf("only salamander and gecko obfs are supported")
 		}
 	} else {
 		if IsPresent(proxy, "obfs") || IsPresent(proxy, "obfs-password") {
@@ -598,9 +656,9 @@ func (p *SurgeProducer) hysteria2(proxy Proxy, includeUnsupported bool) (string,
 	}
 	result.AppendIfPresent(`,port-hopping-interval=%s`, "hop-interval")
 
-	// salamander obfs
-	if IsPresent(proxy, "obfs-password") && GetString(proxy, "obfs") == "salamander" {
-		result.Append(fmt.Sprintf(`,salamander-password="%s"`, GetString(proxy, "obfs-password")))
+	// salamander / gecko obfs
+	if IsPresent(proxy, "obfs-password") && obfsPasswordField != "" {
+		result.Append(fmt.Sprintf(`,%s="%s"`, obfsPasswordField, GetString(proxy, "obfs-password")))
 	}
 
 	p.appendIPVersion(result, proxy)
@@ -641,6 +699,48 @@ func (p *SurgeProducer) ssh(proxy Proxy) (string, error) {
 
 // Helper methods
 
+// trustTunnel 输出 Surge 的 TrustTunnel 节点(上游 536bb1cd 起支持 h3)。
+// 之前没有这个分支,trusttunnel 节点在 Surge 订阅里被当成不支持的类型丢掉。
+func (p *SurgeProducer) trustTunnel(proxy Proxy) (string, error) {
+	result := NewResult(proxy)
+	result.Append(fmt.Sprintf("%s=trust-tunnel,%s,%d",
+		GetString(proxy, "name"), GetString(proxy, "server"), GetInt(proxy, "port")))
+	result.AppendIfPresent(`,username="%v"`, "username")
+	result.AppendIfPresent(`,password="%v"`, "password")
+	// 上游这里还会写根级 headers(appendHeaders),我们这套 producer 尚未支持根级 headers,
+	// 先跳过 —— 缺它只是少一个可选头,不影响节点能不能用。
+	result.AppendIfPresent(",max-streams=%v", "max-streams")
+	if GetString(proxy, "network") == "h3" {
+		result.Append(",h3=true")
+	}
+	p.appendIPVersion(result, proxy)
+	p.appendTLS(result, proxy)
+	p.appendCommonOptions(result, proxy)
+	return result.String(), nil
+}
+
+// masqueSurge 输出 Surge 的 MASQUE 节点(上游 6fff06f1,2026-09-03)。
+func (p *SurgeProducer) masqueSurge(proxy Proxy) (string, error) {
+	result := NewResult(proxy)
+	result.Append(fmt.Sprintf("%s=masque,%s,%d",
+		GetString(proxy, "name"), GetString(proxy, "server"), GetInt(proxy, "port")))
+	result.AppendIfPresent(`,username="%v"`, "username")
+	result.AppendIfPresent(`,password="%v"`, "password")
+
+	if IsPresent(proxy, "ports") {
+		ports := strings.ReplaceAll(GetAnyString(proxy, "ports"), ",", ";")
+		result.Append(fmt.Sprintf(`,port-hopping="%s"`, ports))
+	}
+	if IsPresent(proxy, "hop-interval") {
+		result.Append(fmt.Sprintf(",port-hopping-interval=%s", GetAnyString(proxy, "hop-interval")))
+	}
+
+	p.appendIPVersion(result, proxy)
+	p.appendTLS(result, proxy)
+	p.appendCommonOptions(result, proxy)
+	return result.String(), nil
+}
+
 func (p *SurgeProducer) appendIPVersion(result *Result, proxy Proxy) {
 	if ipVer := GetString(proxy, "ip-version"); ipVer != "" {
 		mappedVersion := ipVersions[ipVer]
@@ -674,6 +774,12 @@ func (p *SurgeProducer) appendTLS(result *Result, _ Proxy) {
 	// SNI - compatible with both SubStore's "sni" and miaomiaowu's "servername"
 	if sni := GetSNI(result.Proxy); sni != "" {
 		result.Append(fmt.Sprintf(",sni=%s", sni))
+	}
+
+	// server-cert-verify-name:证书校验用的名字与 SNI 分开(上游 cfdcc035,2026-07-18)。
+	// 节点字段是 name-cert-verify;之前没输出,自建证书 + 非同名 SNI 的场景在 Surge 上会校验失败。
+	if v := GetString(result.Proxy, "name-cert-verify"); v != "" {
+		result.Append(fmt.Sprintf(",server-cert-verify-name=%s", v))
 	}
 
 	// ALPN - 数组逗号拼接 + 引号（对齐 Sub-Store：alpn="h2,http/1.1"），所有 TLS 协议统一输出
@@ -742,4 +848,37 @@ func (p *SurgeProducer) handleTransport(result *Result, proxy Proxy, includeUnsu
 	}
 
 	return nil
+}
+
+// surgeVmessEncryptValues 镜像 JS formatSurgeVmessEncryptMethod 的支持值。
+var surgeVmessEncryptValues = []string{"aes-128-gcm", "chacha20-poly1305"}
+
+// surgeFormatVmessEncryptMethod 镜像 JS 的 formatSurgeVmessEncryptMethod。
+//
+// 返回空串表示**不输出**这个字段(JS 里是 undefined):归一后是 auto 就交给 Surge
+// 自己挑。命中 chacha20-poly1305 时换成 Surge 用的 ietf 拼法。
+func surgeFormatVmessEncryptMethod(security string) string {
+	normalized := strings.ToLower(strings.TrimSpace(security))
+	const fallback = "auto"
+	if normalized == "" {
+		normalized = fallback
+	}
+	if alias, ok := clashVmessSecurityAliases[normalized]; ok {
+		normalized = alias
+	}
+	matched := ""
+	for _, v := range surgeVmessEncryptValues {
+		if v == normalized {
+			matched = v
+			break
+		}
+	}
+	if matched == "" {
+		// 白名单外一律按 auto 处理 —— 与 JS 的 normalizeVmessSecurity fallback 一致。
+		return ""
+	}
+	if matched == "chacha20-poly1305" {
+		return "chacha20-ietf-poly1305"
+	}
+	return matched
 }

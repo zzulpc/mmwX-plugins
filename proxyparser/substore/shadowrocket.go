@@ -120,9 +120,11 @@ func (p *ShadowrocketProducer) Produce(proxies []Proxy, outputType string, opts 
 					continue
 				}
 			}
-			// 明确不支持的类型
+			// 明确不支持的类型。上游后来补了 shadowquic / zerotier(b63f6084、47ce75a4),
+			// 我们漏掉的话这两类节点会被原样输出到 Shadowrocket 配置里,客户端解析不了。
 			if proxyType == "tailscale" || proxyType == "sudoku" || proxyType == "naive" ||
-				proxyType == "openvpn" || proxyType == "gost-relay" {
+				proxyType == "openvpn" || proxyType == "gost-relay" ||
+				proxyType == "shadowquic" || proxyType == "zerotier" {
 				continue
 			}
 			// JS: network==='xhttp' 仅告警保留(VLESS XHTTP 结构复杂, Shadowrocket 可能无法完全兼容)
@@ -220,17 +222,8 @@ func (p *ShadowrocketProducer) Produce(proxies []Proxy, outputType string, opts 
 
 		// WireGuard transformations
 		if proxyType == "wireguard" {
-			// Keepalive
-			if !IsPresent(transformed, "keepalive") && IsPresent(transformed, "persistent-keepalive") {
-				transformed["keepalive"] = GetInt(transformed, "persistent-keepalive")
-			}
-			transformed["persistent-keepalive"] = GetInt(transformed, "keepalive")
-
-			// Preshared key
-			if !IsPresent(transformed, "preshared-key") && IsPresent(transformed, "pre-shared-key") {
-				transformed["preshared-key"] = GetString(transformed, "pre-shared-key")
-			}
-			transformed["pre-shared-key"] = GetString(transformed, "preshared-key")
+			// Keepalive / preshared key:只在非零 / 非空时输出(见 normalizeWireGuardOptionalFields)
+			normalizeWireGuardOptionalFields(transformed)
 
 			// JS: proxy.ip / proxy.ipv6 = getWireGuardAddressWithCIDR(...)。
 			// 纠正性偏离:Go helper 对无效地址返回空串,而 JS 返回 undefined(随后被 null 清理删除)。

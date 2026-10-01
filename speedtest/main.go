@@ -275,32 +275,7 @@ func connectAndServeWithIPv6Check(wsURL, name string, onConnected func(), ipv6Ch
 		return nil
 	})
 
-	var writeMu = make(chan struct{}, 1)
-	writeMu <- struct{}{}
-	send := func(m wsMsg) error {
-		// 写锁也必须受连接生命周期约束，否则旧连接上的结果可能卡在另一条写操作后，
-		// 等新连接建立后才尝试回传，既占着任务槽也制造误导日志。
-		select {
-		case <-connectionCtx.Done():
-			return connectionCtx.Err()
-		case <-writeMu:
-		}
-		defer func() { writeMu <- struct{}{} }()
-		select {
-		case <-connectionCtx.Done():
-			return connectionCtx.Err()
-		default:
-		}
-		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		data, _ := json.Marshal(m)
-		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
-			// 写失败已经能证明这条连接不可用，立即取消它派发的任务，
-			// 不必再等读超时到期才释放测速与拨测资源。
-			cancelConnection()
-			return err
-		}
-		return nil
-	}
+	send := connectionSender(connectionCtx, cancelConnection, conn)
 
 	// hello 带上版本与能力集。老版本只发 Name —— 主控据「有没有 caps」判断能否派可达性探测,
 	// 否则给老测速端派 probe 会被静默丢弃,主控只能干等超时。
@@ -704,4 +679,41 @@ func dialProbe(ctx context.Context, target string, timeout time.Duration) probeR
 	res.OK = true
 	res.LatencyMs = time.Since(start).Milliseconds()
 	return res
+}
+
+// 抽出发送端便于模拟单向写故障；Close 与读操作并发安全，写失败必须结束整条连接。
+type websocketWriter interface {
+	SetWriteDeadline(time.Time) error
+	WriteMessage(int, []byte) error
+	Close() error
+}
+
+func connectionSender(connectionCtx context.Context, cancelConnection context.CancelFunc, conn websocketWriter) func(wsMsg) error {
+	var writeMu = make(chan struct{}, 1)
+	writeMu <- struct{}{}
+	return func(m wsMsg) error {
+		// 写锁也必须受连接生命周期约束，否则旧连接上的结果可能卡在另一条写操作后，
+		// 等新连接建立后才尝试回传，既占着任务槽也制造误导日志。
+		select {
+		case <-connectionCtx.Done():
+			return connectionCtx.Err()
+		case <-writeMu:
+		}
+		defer func() { writeMu <- struct{}{} }()
+		select {
+		case <-connectionCtx.Done():
+			return connectionCtx.Err()
+		default:
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		data, _ := json.Marshal(m)
+		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+			// 写失败已经能证明这条连接不可用，立即取消它派发的任务，
+			// 不必再等读超时到期才释放测速与拨测资源。
+			cancelConnection()
+			_ = conn.Close() // 同时唤醒 ReadMessage，不能让仍有下行流量的坏连接阻止重连。
+			return err
+		}
+		return nil
+	}
 }

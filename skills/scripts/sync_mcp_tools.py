@@ -23,6 +23,9 @@ CATEGORIES = (
     ("自定义规则", ("custom_rule_",)),
     ("节点", ("node_",)),
     ("套餐", ("package_",)),
+    ("转发", ("forward_",)),
+    ("证书", ("cert_",)),
+    ("日志与任务", ("logs_", "task_")),
     ("旧版模板", ("rule_template_",)),
     ("远程服务器", ("server_",)),
     ("测速端", ("speedtest_",)),
@@ -46,10 +49,16 @@ def parse_args() -> argparse.Namespace:
         default=Path(__file__).resolve().parents[1] / "README.md",
         help="要核验或更新的 README 路径",
     )
+    parser.add_argument("--schema", type=Path, help="同时核验或写入去除描述/默认值/示例的输入契约快照")
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--check", action="store_true", help="仅核验 README，不写文件")
     action.add_argument("--write", action="store_true", help="更新 README 中的生成区块")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.schema and not (args.check or args.write):
+        parser.error("--schema 必须与 --check 或 --write 一起使用")
+    if args.schema and args.schema.resolve() == args.readme.resolve():
+        parser.error("契约快照与 README 不能使用同一路径")
+    return args
 
 
 def decode_response(raw: bytes) -> dict[str, Any]:
@@ -79,13 +88,29 @@ def fetch_registry(url: str) -> dict[str, Any]:
     if token:
         # 令牌只从环境变量读取，避免进入命令历史或进程参数列表。
         headers["Authorization"] = f"Bearer {token}"
-    body = json.dumps(
-        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
-        separators=(",", ":"),
-    ).encode("utf-8")
-    request = Request(url, data=body, headers=headers, method="POST")
-    with urlopen(request, timeout=30) as response:
-        return decode_response(response.read())
+    collected: list[dict[str, Any]] = []
+    cursor = None
+    seen_cursors: set[str] = set()
+    for page in range(1000):
+        params = {} if cursor is None else {"cursor": cursor}
+        body = json.dumps(
+            {"jsonrpc": "2.0", "id": page + 1, "method": "tools/list", "params": params},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        request = Request(url, data=body, headers=headers, method="POST")
+        with urlopen(request, timeout=30) as response:
+            payload = decode_response(response.read())
+        # 每页单独校验；合并后再次校验以拒绝跨页重名。
+        collected.extend(extract_tools(payload, allow_pagination=True))
+        cursor = payload["result"].get("nextCursor")
+        if cursor is None:
+            complete = {"result": {"tools": collected}}
+            extract_tools(complete)
+            return complete
+        if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+            raise ValueError("tools/list 分页游标无效或重复，拒绝保存不完整清单")
+        seen_cursors.add(cursor)
+    raise ValueError("tools/list 超过分页上限，拒绝保存不完整清单")
 
 
 def load_registry(args: argparse.Namespace) -> dict[str, Any]:
@@ -94,7 +119,11 @@ def load_registry(args: argparse.Namespace) -> dict[str, Any]:
     return fetch_registry(args.url)
 
 
-def extract_tools(payload: dict[str, Any]) -> list[dict[str, Any]]:
+def extract_tools(payload: dict[str, Any], *, allow_pagination: bool = False) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("result", {}), dict):
+        raise ValueError("tools/list 响应必须是对象")
+    if not allow_pagination and payload.get("result", {}).get("nextCursor") is not None:
+        raise ValueError("离线输入仍有 nextCursor，请提供完整清单或使用 --url 自动分页")
     if "error" in payload:
         raise ValueError(f"MCP 返回错误: {payload['error']}")
     tools = payload.get("result", {}).get("tools")
@@ -116,8 +145,44 @@ def extract_tools(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return normalized
 
 
+# 快照只保留参数结构和约束，不携带说明里的实例数据、默认凭据或运行时返回值。
+SCHEMA_ANNOTATIONS = {"description", "title", "default", "examples", "example", "$comment", "markdownDescription"}
+SCHEMA_MAPS = {"properties", "$defs", "definitions", "patternProperties", "dependentSchemas"}
+
+def contract_schema(value: Any) -> Any:
+    if isinstance(value, list):
+        return [contract_schema(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {}
+    for key, item in value.items():
+        if key in SCHEMA_ANNOTATIONS:
+            continue
+        # properties 中名为 default/description 的参数仍是契约，不能当注释删除。
+        if key in SCHEMA_MAPS and isinstance(item, dict):
+            result[key] = {name: contract_schema(schema) for name, schema in item.items()}
+        elif key in {"enum", "const"}:
+            result[key] = item
+        else:
+            result[key] = contract_schema(item)
+    return result
+
+
+def render_contract(version: str, tools: list[dict[str, Any]]) -> str:
+    contracts = []
+    for tool in sorted(tools, key=lambda t: t["name"]):
+        schema = tool.get("inputSchema")
+        if not isinstance(schema, dict):
+            raise ValueError(f"{tool['name']} 缺少 inputSchema，不能生成契约快照")
+        contracts.append({"name": tool["name"], "inputSchema": contract_schema(schema)})
+    return json.dumps({"version": version, "tools": contracts}, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+
+
 def requires_confirm(tool: dict[str, Any]) -> bool:
-    properties = tool.get("inputSchema", {}).get("properties", {})
+    schema = tool.get("inputSchema")
+    if not isinstance(schema, dict):
+        return False
+    properties = schema.get("properties", {})
     return isinstance(properties, dict) and "confirm" in properties
 
 
@@ -180,23 +245,31 @@ def main() -> int:
 
         current = args.readme.read_text(encoding="utf-8")
         expected = replace_block(current, generated)
+        changes = [(args.readme, current, expected)]
+        if args.schema:
+            contract = render_contract(args.version, tools)
+            previous = args.schema.read_text(encoding="utf-8") if args.schema.exists() else ""
+            if not args.schema.parent.is_dir():
+                raise ValueError("契约快照的父目录不存在")
+            changes.append((args.schema, previous, contract))
         if args.write:
-            args.readme.write_text(expected, encoding="utf-8")
+            for path, _, content in changes:
+                path.write_text(content, encoding="utf-8")
             print(f"已更新 {args.readme}，工具数: {len(tools)}")
             return 0
-        if current == expected:
-            print(f"PASS: {args.readme} 与 {args.version} 注册表一致，工具数: {len(tools)}")
-            return 0
-
-        diff = difflib.unified_diff(
-            current.splitlines(),
-            expected.splitlines(),
-            fromfile=str(args.readme),
-            tofile=f"{args.readme}（注册表生成）",
-            lineterm="",
-        )
-        print("\n".join(diff), file=sys.stderr)
-        return 1
+        failed = False
+        for path, previous, content in changes:
+            if previous == content:
+                continue
+            failed = True
+            print("\n".join(difflib.unified_diff(
+                previous.splitlines(), content.splitlines(),
+                fromfile=str(path), tofile=f"{path}（注册表生成）", lineterm="",
+            )), file=sys.stderr)
+        if failed:
+            return 1
+        print(f"PASS: 清单和指定契约与 {args.version} 注册表一致，工具数: {len(tools)}")
+        return 0
     except (OSError, ValueError) as error:
         print(f"错误: {error}", file=sys.stderr)
         return 2

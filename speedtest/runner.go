@@ -47,7 +47,7 @@ const (
 	// runExecutionBudget 只从任务取得执行权之后开始走,不含排队等待 —— 排队预算见 main.go
 	// 的 runQueueWaitBudget。两者以前混在一起,4 个在途任务共用同一个 38s 时钟,
 	// 排在后面的任务会被前面的执行时间吃光预算。
-	runExecutionBudget = coreReadyTimeout + singBoxCheckTimeout + egressProbeTimeout +
+	runExecutionBudget = kernelPrepareTimeout + coreReadyTimeout + singBoxCheckTimeout + egressProbeTimeout +
 		latencyProbeTimeout + downloadSetupTime + defaultTestDuration + runPhaseMargin
 )
 
@@ -94,7 +94,7 @@ type Options struct {
 	TestBytes    int64         // 可选下载上限(0=不限,纯按时长)
 	Timeout      time.Duration
 	Threads      int  // 并发下载线程数(<=1 单线程)
-	BufSize      int  // 每次收发的 io/socket buffer 字节数(默认 1MB;clamp 见 clampSpeedTestParams)
+	BufSize      int  // HTTP Transport 读缓冲字节数(默认 1MB;clamp 见 clampSpeedTestParams)
 	LatencyOnly  bool // true 仅测真连接延迟(Cloudflare 204 多采样)不跑大文件下载
 }
 
@@ -106,9 +106,8 @@ const (
 	maxBufSize       = 16 << 20  // 16MB
 	maxSpeedThreads  = 64        // 并发下载线程上限
 	maxSpeedTotalMem = 256 << 20 // 峰值内存上限:超了缩 BufSize
-	// downloadBuffersPerThread:每条下载流实际占两份 bufSize —— io.CopyBuffer 的 buffer 一份,
-	// 该线程自己那个 http.Transport 的 ReadBufferSize 又一份(见 newProxyTransport)。
-	// 原来只按一份算,64 线程 × 4MB 实际吃掉 ~512MB,是这个 256MB 闸门的两倍。
+	// 保留既有二倍预算作为保守上限；大缓冲仅用于 Transport，额外余量覆盖写缓冲和协议开销。
+	// io.Discard 自带小块读取缓冲，不能再为被 ReaderFrom 绕过的 CopyBuffer 分配大数组。
 	downloadBuffersPerThread = 2
 )
 
@@ -119,7 +118,7 @@ var (
 )
 
 // clampSpeedTestParams 归一 bufSize(字节)与 threads,并把峰值内存收敛到 maxSpeedTotalMem 内。
-// 峰值按 bufSize × threads × downloadBuffersPerThread 算,不是只算 copy buffer 那一份。
+// 继续保留原有 bufSize 和线程数上限，删除无效分配不等于自动提高任务内存额度。
 // 0/越界回落默认(bufSize=1MB, threads=1)。
 func clampSpeedTestParams(bufSize, threads int) (int, int) {
 	if threads <= 0 {
@@ -361,24 +360,6 @@ func proxyClientBuf(mixedPort, bufSize int) *http.Client {
 	return &http.Client{Transport: newProxyTransport(mixedPort, bufSize)}
 }
 
-// getCopyBuf/putCopyBuf 自适应 io.CopyBuffer 缓冲池:cap>=size 复用,否则新建。
-// 支持用户选的 1/4/8/16M 包大小(峰值内存 ≈ bufSize×threads,已由 clampSpeedTestParams 收敛)。
-var copyBufPool sync.Pool
-
-func getCopyBuf(size int) *[]byte {
-	if v := copyBufPool.Get(); v != nil {
-		b := v.(*[]byte)
-		if cap(*b) >= size {
-			*b = (*b)[:size]
-			return b
-		}
-	}
-	b := make([]byte, size)
-	return &b
-}
-
-func putCopyBuf(b *[]byte) { copyBufPool.Put(b) }
-
 // measureLatency 经代理 GET 一个 204 端点,返回毫秒;失败返回 -1。
 //
 // 固定端点只认 204；登录页或错误页即使返回 200，也不能作为有效延迟。
@@ -477,21 +458,42 @@ type sharedDownloadQuota struct {
 	total    atomic.Int64
 	mu       sync.Mutex
 	reserved int64
+	changed  chan struct{}
 	cancel   context.CancelCauseFunc
 }
 
-func (q *sharedDownloadQuota) reserve(size int) int {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	remaining := q.maxBytes - q.total.Load() - q.reserved
-	if remaining <= 0 {
-		return 0
+// 暂被其它读取预留的额度可能退回，等待结算而不是提前宣告成功。
+func (q *sharedDownloadQuota) reserve(ctx context.Context, size int) (int, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		q.mu.Lock()
+		total := q.total.Load()
+		if total >= q.maxBytes {
+			q.mu.Unlock()
+			return 0, errDownloadQuotaReached
+		}
+		remaining := q.maxBytes - total - q.reserved
+		if remaining > 0 {
+			if int64(size) > remaining {
+				size = int(remaining)
+			}
+			q.reserved += int64(size)
+			q.mu.Unlock()
+			return size, nil
+		}
+		if q.changed == nil {
+			q.changed = make(chan struct{})
+		}
+		changed := q.changed
+		q.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-changed:
+		}
 	}
-	if int64(size) > remaining {
-		size = int(remaining)
-	}
-	q.reserved += int64(size)
-	return size
 }
 
 func (q *sharedDownloadQuota) finish(reserved, read int) {
@@ -499,6 +501,10 @@ func (q *sharedDownloadQuota) finish(reserved, read int) {
 	q.reserved -= int64(reserved)
 	total := q.total.Add(int64(read))
 	reached := total >= q.maxBytes
+	if q.changed != nil {
+		close(q.changed)
+		q.changed = nil
+	}
 	q.mu.Unlock()
 	if reached {
 		q.cancel(errDownloadQuotaReached)
@@ -507,15 +513,18 @@ func (q *sharedDownloadQuota) finish(reserved, read int) {
 
 // sharedQuotaReader 在读取响应体之前先抢占额度，避免多个线程同时读过上限后才截断统计值。
 type sharedQuotaReader struct {
+	ctx    context.Context
 	source io.Reader
 	quota  *sharedDownloadQuota
 }
 
 func (r *sharedQuotaReader) Read(p []byte) (int, error) {
-	reserved := r.quota.reserve(len(p))
-	if reserved == 0 {
-		// 额度可能已被其它并发读取预留但尚未结算；用专用终止原因避免把正常竞争误记为空响应。
-		return 0, errDownloadQuotaReached
+	if len(p) == 0 {
+		return 0, nil
+	}
+	reserved, err := r.quota.reserve(r.ctx, len(p))
+	if err != nil {
+		return 0, err
 	}
 	n, err := r.source.Read(p[:reserved])
 	r.quota.finish(reserved, n)
@@ -829,13 +838,12 @@ func downloadSingleAttempt(ctx context.Context, dlURL string, maxBytes int64, bu
 	}
 	var reader io.Reader = resp.Body
 	if quota != nil {
-		reader = &sharedQuotaReader{source: resp.Body, quota: quota}
+		reader = &sharedQuotaReader{ctx: ctx, source: resp.Body, quota: quota}
 	} else if maxBytes > 0 {
 		reader = io.LimitReader(resp.Body, maxBytes)
 	}
-	buf := getCopyBuf(bufSize)
-	defer putCopyBuf(buf)
-	n, cerr := io.CopyBuffer(io.Discard, reader, *buf)
+	// io.Discard.ReadFrom 会自行复用 8 KiB 缓冲，额外传入大缓冲不会被使用。
+	n, cerr := io.Copy(io.Discard, reader)
 	elapsed := time.Since(start)
 	if errors.Is(cerr, errDownloadQuotaReached) {
 		return n, elapsed, true, false, nil

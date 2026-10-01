@@ -6,10 +6,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/zzulpc/mmwX-plugins/proxyparser/internal/valueutil"
 )
@@ -52,6 +54,7 @@ func parseQueryParams(query string) map[string]string {
 		kv := strings.SplitN(pair, "=", 2)
 		if len(kv) == 2 {
 			key, _ := url.QueryUnescape(kv[0])
+			// query 是表单编码('+' 是空格),obfs-password 等密码参数也不例外(#885 只动 userinfo)
 			value, _ := url.QueryUnescape(kv[1])
 			params[key] = value
 		} else if len(kv) == 1 {
@@ -320,12 +323,9 @@ func parseShadowsocksURL(uri string) (map[string]any, error) {
 
 	if strings.Contains(mainPart, "@") {
 		atIdx := strings.LastIndex(mainPart, "@")
-		authPart := mainPart[:atIdx]
-		if strings.Contains(authPart, "%") {
-			if decoded, err := url.QueryUnescape(authPart); err == nil {
-				authPart = decoded
-			}
-		}
+		// userinfo 不是表单编码,'+' 是字面量。2022 的 PSK 和标准 base64 userinfo 都含 '+',
+		// 只要同时出现 %3D / %2F / %3A,QueryUnescape 就把 '+' 变成空格(#885)。
+		authPart := unescapeKeepPlus(mainPart[:atIdx])
 		serverPart := mainPart[atIdx+1:]
 
 		// Parse server:port
@@ -431,7 +431,9 @@ func parseShadowsocksURL(uri string) (map[string]any, error) {
 
 // parseSSPlugin parses SS plugin string
 func parseSSPlugin(pluginStr string) map[string]any {
-	decoded, _ := url.QueryUnescape(pluginStr)
+	// pluginStr 已被 parseQueryParams 按表单解过一层,这里再解一层是兼容双重编码;
+	// 这一层不能再把 '+' 当空格,否则 shadow-tls 密码 / obfs-host 里的 '+' 导不回来。
+	decoded := unescapeKeepPlus(pluginStr)
 	parts := strings.Split(decoded, ";")
 	if len(parts) == 0 {
 		return nil
@@ -636,13 +638,14 @@ func parseSocksURL(uri string) (map[string]any, error) {
 		if isPlainAuth {
 			colonIdx := strings.Index(authPart, ":")
 			if colonIdx != -1 {
-				username, _ = url.QueryUnescape(authPart[:colonIdx])
-				password, _ = url.QueryUnescape(authPart[colonIdx+1:])
+				username = unescapeKeepPlus(authPart[:colonIdx])
+				password = unescapeKeepPlus(authPart[colonIdx+1:])
 			} else {
-				username, _ = url.QueryUnescape(authPart)
+				username = unescapeKeepPlus(authPart)
 			}
 		} else {
-			decoded, err := base64DecodeURLSafe(authPart)
+			// 导出端(uri.go)对 base64 做了 PathEscape,'/' 会写成 %2F,先解 %XX 再解 base64
+			decoded, err := base64DecodeURLSafe(unescapeKeepPlus(authPart))
 			if err == nil {
 				colonIdx := strings.Index(decoded, ":")
 				if colonIdx != -1 {
@@ -720,7 +723,7 @@ func parseTrojanURL(uri string) (map[string]any, error) {
 		return nil, fmt.Errorf("invalid trojan url: missing @")
 	}
 
-	password := mainPart[:atIdx]
+	password := unescapeKeepPlus(mainPart[:atIdx])
 	serverPart := mainPart[atIdx+1:]
 
 	server, port := parseServerPortWithDefault(serverPart, 443)
@@ -1052,7 +1055,7 @@ func parseHysteriaGeneric(uri string, protocol string) (map[string]any, error) {
 	// Extract name
 	if idx := strings.LastIndex(content, "#"); idx != -1 {
 		mainPart = content[:idx]
-		name, _ = url.QueryUnescape(content[idx+1:])
+		name = unescapeKeepPlus(content[idx+1:])
 	}
 
 	// Extract query params
@@ -1063,24 +1066,36 @@ func parseHysteriaGeneric(uri string, protocol string) (map[string]any, error) {
 	}
 	mainPart = strings.TrimSuffix(mainPart, "/")
 
-	// Parse password@server:port
+	// v1 的标准认证位于 auth 查询参数；同时接受旧版 userinfo 写法。
+	// v2 仍要求 userinfo，不能将缺少凭据的链接默认为可用节点。
 	atIdx := strings.LastIndex(mainPart, "@")
-	if atIdx == -1 {
+	serverPart, password := mainPart, ""
+	if atIdx >= 0 {
+		password = unescapeKeepPlus(mainPart[:atIdx])
+		serverPart = mainPart[atIdx+1:]
+	} else if protocol != "hysteria" {
 		return nil, fmt.Errorf("invalid %s url: missing @", protocol)
 	}
-
-	password := safeDecodeURIComponent(mainPart[:atIdx])
-	serverPart := mainPart[atIdx+1:]
-
-	server, port := parseServerPortWithDefault(serverPart, 0)
-
+	server, port, hopPorts := parseServerPortHop(serverPart)
+	if server == "" || port < 1 || port > 65535 {
+		return nil, fmt.Errorf("invalid %s server or port", protocol)
+	}
 	node := map[string]any{
-		"name":     name,
-		"type":     protocol,
-		"server":   server,
-		"port":     port,
-		"password": password,
-		"udp":      true,
+		"name": name, "type": protocol, "server": server, "port": port, "udp": true,
+	}
+	if protocol == "hysteria" {
+		if auth, ok := queryParams["auth"]; ok {
+			password = auth
+		}
+		node["auth-str"] = password
+		if transport := queryParams["protocol"]; transport != "" {
+			node["protocol"] = transport
+		}
+	} else {
+		node["password"] = password
+	}
+	if queryParams["fastopen"] == "1" || queryParams["fastopen"] == "true" {
+		node["tfo"] = true
 	}
 
 	// SNI (支持显式空字符串)
@@ -1090,13 +1105,18 @@ func parseHysteriaGeneric(uri string, protocol string) (map[string]any, error) {
 		node["sni"] = peer
 	}
 
-	// OBFS
-	if obfs := queryParams["obfs"]; obfs != "" {
+	// v1 的 obfsParam 是混淆密钥，v2 的 obfs 是算法名，两者不能共用字段映射。
+	if protocol == "hysteria" {
+		if obfs := queryParams["obfs"]; obfs != "" {
+			node["_obfs"] = obfs
+		}
+		if obfs := queryParams["obfsParam"]; obfs != "" {
+			node["obfs"] = obfs
+		}
+	} else if obfs := queryParams["obfs"]; obfs != "" {
 		node["obfs"] = obfs
-		if obfsPassword := queryParams["obfs-password"]; obfsPassword != "" {
-			node["obfs-password"] = obfsPassword
-		} else if obfsParam := queryParams["obfsParam"]; obfsParam != "" {
-			node["obfs-password"] = obfsParam
+		if password := firstNonEmpty(queryParams, "obfs-password", "obfsParam"); password != "" {
+			node["obfs-password"] = password
 		}
 	}
 
@@ -1126,7 +1146,10 @@ func parseHysteriaGeneric(uri string, protocol string) (map[string]any, error) {
 		node["down"] = downmbps
 	}
 
-	// Port hopping（mport / ports 别名）
+	// Port hopping：authority 中的端口范围/列表（如 443,20000-30000），query 的 mport / ports 优先
+	if hopPorts != "" {
+		node["ports"] = hopPorts
+	}
 	if ports := firstNonEmpty(queryParams, "mport", "ports"); ports != "" {
 		node["ports"] = ports
 	}
@@ -1173,7 +1196,7 @@ func parseTuicURL(uri string) (map[string]any, error) {
 		return nil, fmt.Errorf("invalid tuic url: missing @")
 	}
 
-	authPart := safeDecodeURIComponent(mainPart[:atIdx])
+	authPart := unescapeKeepPlus(mainPart[:atIdx])
 	serverPart := mainPart[atIdx+1:]
 
 	var uuid, password string
@@ -1272,7 +1295,8 @@ func parseAnytlsURL(uri string) (map[string]any, error) {
 		return nil, fmt.Errorf("invalid anytls url: missing @")
 	}
 
-	password := mainPart[:atIdx]
+	// 导出端用 url.PathEscape,这里对应解 %XX('+' 保持字面量)
+	password := unescapeKeepPlus(mainPart[:atIdx])
 	serverPart := mainPart[atIdx+1:]
 
 	server, port := parseServerPortWithDefault(serverPart, 443)
@@ -1325,6 +1349,31 @@ func parseAnytlsURL(uri string) (map[string]any, error) {
 		}
 	}
 
+	// 对齐 Sub-Store 的 URI_AnyTLS: 把同一条 URI 交给 VLESS 解析器再解一遍,
+	// 借它拿到 reality-opts / network / security 三项(本函数自己不解析 REALITY)。
+	// 这不只是为了补全字段: Sub-Store 在存在 reality-opts 时刻意保留 network="tcp",
+	// 下游 clashmeta/stash/loon 正是靠这个标记剔除自己不支持的 AnyTLS+REALITY 组合
+	// (mihomo 官方声明不支持该组合且不打算支持), 只放行 sing-box。少了这个标记,
+	// 带 REALITY 的节点会被错误下发给这些客户端。
+	if vlessNode, verr := parseVlessURL("vless://" + content); verr == nil {
+		if ro := vlessNode["reality-opts"]; ro != nil {
+			node["reality-opts"] = ro
+		}
+		if nw, ok := vlessNode["network"].(string); ok && nw != "" {
+			node["network"] = nw
+		}
+		if sec, ok := vlessNode["security"].(string); ok && sec != "" {
+			node["security"] = sec
+		}
+	}
+
+	// Sub-Store: network 为 tcp 且没有 reality-opts 时, 抹掉 network/security,
+	// 使普通 AnyTLS 节点不带多余标记, 各客户端照常下发。
+	if nw, _ := node["network"].(string); nw == "tcp" && node["reality-opts"] == nil {
+		delete(node, "network")
+		delete(node, "security")
+	}
+
 	return node, nil
 }
 
@@ -1338,16 +1387,21 @@ func parseWireGuardURL(uri string) (map[string]any, error) {
 		return nil, fmt.Errorf("invalid wireguard url")
 	}
 
-	privateKey, _ := url.QueryUnescape(match[2])
+	// 私钥是标准 base64,约一半含 '+'。QueryUnescape 会把 '+' 变成空格,密钥当场作废;
+	// 我们自己导出的 URI(uri.go 用 PathEscape)也就导不回来。这里按 RFC 3986 只解 %XX。
+	privateKey := unescapeKeepPlus(match[2])
 	server := match[3]
 	port := 51820
 	if match[5] != "" {
 		port, _ = strconv.Atoi(match[5])
 	}
+	server, port = normalizeWireGuardHost(server, match[5], port)
 	addons := match[7]
 	name := match[8]
 	if name != "" {
-		name, _ = url.QueryUnescape(name)
+		// 片段不是表单编码,'+' 是字面量(与上游 Sub-Store 的 decodeURIComponent 一致)。
+		// QueryUnescape 会把 'WG+HK' 解成 'WG HK',自己导出的 URI 也就导不回来。
+		name = unescapeKeepPlus(name)
 	} else {
 		name = fmt.Sprintf("WireGuard %s:%d", server, port)
 	}
@@ -1372,6 +1426,10 @@ func parseWireGuardURL(uri string) (map[string]any, error) {
 		}
 		key := strings.ToLower(strings.ReplaceAll(kv[0], "_", "-"))
 		value, _ := url.QueryUnescape(kv[1])
+		if isWireGuardKeyParam(key) {
+			// 密钥类参数里的 '+' 是 base64 字符,不是空格(未转义的 publickey=Zz+y= 很常见)
+			value = unescapeKeepPlus(kv[1])
+		}
 
 		switch key {
 		case "reserved":
@@ -1407,19 +1465,18 @@ func parseWireGuardURL(uri string) (map[string]any, error) {
 		case "udp":
 			node["udp"] = value == "true" || value == "1"
 		case "allowed-ips":
-			if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
-				innerValue := value[1 : len(value)-1]
-				parts := strings.Split(innerValue, ",")
-				var ips []string
-				for _, p := range parts {
-					p = strings.TrimSpace(p)
-					if p != "" {
-						ips = append(ips, p)
-					}
-				}
+			if ips := splitWireGuardURIList(value); len(ips) > 0 {
 				node["allowed-ips"] = ips
-			} else {
-				node["allowed-ips"] = value
+			}
+		case "dns":
+			// mihomo 的 dns 是列表,原样存成逗号串会输出成标量。用 []interface{}(YAML 读回来的
+			// 形态):Loon / Egern / Surge 的 WG dns 处理只认这个类型和字符串,不认 []string。
+			if servers := splitWireGuardURIList(value); len(servers) > 0 {
+				list := make([]interface{}, len(servers))
+				for i, s := range servers {
+					list[i] = s
+				}
+				node["dns"] = list
 			}
 		default:
 			if key != "name" && key != "type" && key != "server" && key != "port" && key != "private-key" && key != "flag" {
@@ -1429,6 +1486,53 @@ func parseWireGuardURL(uri string) (map[string]any, error) {
 	}
 
 	return node, nil
+}
+
+// unescapeKeepPlus 按 RFC 3986 解 %XX,'+' 保持字面量(对应 JS 的 decodeURIComponent)。
+// 解码失败时原样返回,不把整个值丢成空串。
+func unescapeKeepPlus(s string) string {
+	if v, err := url.PathUnescape(s); err == nil {
+		return v
+	}
+	return s
+}
+
+// splitWireGuardURIList 把 wireguard:// 里的列表参数拆开。认 `a,b`(uri.go 导出的写法,与前端
+// encodeURIComponent(数组) 一致)、`[a,b]`,以及 v0.2.7 按 %v 导出的 `[a b]`。
+func splitWireGuardURIList(value string) []string {
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
+		value = value[1 : len(value)-1]
+	}
+	return strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || unicode.IsSpace(r)
+	})
+}
+
+// isWireGuardKeyParam 判断 wireguard:// 的参数是不是密钥(base64,可能含 '+' '/' '=')。
+func isWireGuardKeyParam(key string) bool {
+	switch key {
+	case "publickey", "public-key", "privatekey", "private-key",
+		"presharedkey", "preshared-key", "pre-shared-key":
+		return true
+	}
+	return false
+}
+
+// normalizeWireGuardHost 处理 IPv6 主机:`[v6]:port` 去掉方括号;没加方括号也没写端口的
+// v6(`@2001:db8::1/?`)会被正则把最后一段当成端口,认出来后还原成主机、端口回落默认值。
+func normalizeWireGuardHost(server, rawPort string, port int) (string, int) {
+	if strings.HasPrefix(server, "[") && strings.HasSuffix(server, "]") {
+		return server[1 : len(server)-1], port
+	}
+	if rawPort != "" && strings.Contains(server, ":") {
+		if _, err := netip.ParseAddr(server); err != nil {
+			if addr, err := netip.ParseAddr(server + ":" + rawPort); err == nil && addr.Is6() {
+				return server + ":" + rawPort, 51820
+			}
+		}
+	}
+	return server, port
 }
 
 // parseHTTPURL parses http:// or https:// proxy URL
@@ -1460,10 +1564,10 @@ func parseHTTPURL(uri string) (map[string]any, error) {
 		authPart := mainPart[:atIdx]
 		serverPart = mainPart[atIdx+1:]
 		if colonIdx := strings.Index(authPart, ":"); colonIdx != -1 {
-			username, _ = url.QueryUnescape(authPart[:colonIdx])
-			password, _ = url.QueryUnescape(authPart[colonIdx+1:])
+			username = unescapeKeepPlus(authPart[:colonIdx])
+			password = unescapeKeepPlus(authPart[colonIdx+1:])
 		} else {
-			username, _ = url.QueryUnescape(authPart)
+			username = unescapeKeepPlus(authPart)
 		}
 	} else {
 		serverPart = mainPart
@@ -1522,10 +1626,10 @@ func parseNaiveURL(uri string) (map[string]any, error) {
 
 	var username, password string
 	if colonIdx := strings.Index(authPart, ":"); colonIdx != -1 {
-		username, _ = url.QueryUnescape(authPart[:colonIdx])
-		password, _ = url.QueryUnescape(authPart[colonIdx+1:])
+		username = unescapeKeepPlus(authPart[:colonIdx])
+		password = unescapeKeepPlus(authPart[colonIdx+1:])
 	} else {
-		username, _ = url.QueryUnescape(authPart)
+		username = unescapeKeepPlus(authPart)
 	}
 
 	node := map[string]any{
@@ -1555,9 +1659,18 @@ func parseNaiveURL(uri string) (map[string]any, error) {
 	return node, nil
 }
 
-// parseMieruURL parses mieru:// URL
+// parseMieruURL parses mieru:// / mierus:// URL
+//
+// 官方客户端导出的链接长这样(#115),与社区常见写法有三处不同,逐一在下面处理:
+//
+//		mierus://user:pass@1.2.3.4?handshake-mode=HANDSHAKE_NO_WAIT&mtu=1400
+//		   &multiplexing=MULTIPLEXING_OFF&port=11211&profile=default&protocol=TCP
+//
+//	  - scheme 带 s
+//	  - **端口在 query 里**,host 段只有地址 —— 按老写法解析出来端口是 0,节点连不上
+//	  - 传输协议叫 protocol,不叫 transport
 func parseMieruURL(uri string) (map[string]any, error) {
-	content := strings.TrimPrefix(uri, "mieru://")
+	content := strings.TrimPrefix(strings.TrimPrefix(uri, "mierus://"), "mieru://")
 	name := "Mieru Node"
 	mainPart := content
 
@@ -1578,9 +1691,16 @@ func parseMieruURL(uri string) (map[string]any, error) {
 		return nil, fmt.Errorf("invalid mieru url: missing @")
 	}
 
-	authPart, _ := url.QueryUnescape(mainPart[:atIdx])
+	authPart := unescapeKeepPlus(mainPart[:atIdx])
 	serverPart := mainPart[atIdx+1:]
 	server, port := parseServerPortWithDefault(serverPart, 0)
+	// host 段没带端口时从 query 取 —— 官方导出的链接就是这么写的。
+	// host 段带了就以它为准:那是更具体的写法,不该被 query 覆盖。
+	if port == 0 {
+		if v, err := strconv.Atoi(queryParams["port"]); err == nil && v > 0 && v < 65536 {
+			port = v
+		}
+	}
 
 	var username, password string
 	if colonIdx := strings.Index(authPart, ":"); colonIdx != -1 {
@@ -1599,11 +1719,15 @@ func parseMieruURL(uri string) (map[string]any, error) {
 		"password": password,
 	}
 
-	if v := queryParams["transport"]; v != "" {
-		node["transport"] = v
-	} else if v := queryParams["handshake-mode"]; v != "" {
-		node["transport"] = v
-	} else {
+	// transport 只有 TCP / UDP 两个合法值(下游按它决定 xray 入站网络类型)。
+	// 官方链接里叫 protocol;原先的 handshake-mode 兜底是错的 ——
+	// HANDSHAKE_NO_WAIT 之类根本不是传输方式,塞进去等于写了个无效值。
+	switch {
+	case queryParams["transport"] != "":
+		node["transport"] = queryParams["transport"]
+	case queryParams["protocol"] != "":
+		node["transport"] = queryParams["protocol"]
+	default:
 		node["transport"] = "TCP"
 	}
 
@@ -1713,7 +1837,9 @@ func Parse(uri string) (map[string]any, error) {
 		return parseHTTPURL(uri)
 	case strings.HasPrefix(uri, "naive://"), strings.HasPrefix(uri, "naive+https://"), strings.HasPrefix(uri, "naive+http://"):
 		return parseNaiveURL(uri)
-	case strings.HasPrefix(uri, "mieru://"):
+	// mieru 官方客户端导出的链接用的是 mierus://(带 s),社区里两种写法都在流传。
+	// 只认 mieru:// 的话,官方导出的链接直接「不支持的协议」被丢掉(许可证站 #115)。
+	case strings.HasPrefix(uri, "mieru://"), strings.HasPrefix(uri, "mierus://"):
 		return parseMieruURL(uri)
 	case strings.HasPrefix(uri, "snell://"):
 		return parseSnellURL(uri)
@@ -1837,6 +1963,41 @@ func parseServerPortWithDefault(serverPart string, defaultPort int) (string, int
 	}
 
 	return server, port
+}
+
+// portHopRe 匹配端口跳跃写法：单个范围或逗号分隔的端口/范围列表（如 20000-30000、443,20000-30000）。
+var portHopRe = regexp.MustCompile(`^\d+(-\d+)?(,\d+(-\d+)?)*$`)
+
+// parseServerPortHop 解析 host:port，port 段允许端口跳跃写法：
+// port 取第一个端口/范围起点，hopPorts 返回完整端口串；普通单端口时 hopPorts 为空。
+func parseServerPortHop(serverPart string) (server string, port int, hopPorts string) {
+	hostPart, portPart := serverPart, ""
+	if strings.HasPrefix(serverPart, "[") {
+		if i := strings.Index(serverPart, "]"); i != -1 && strings.HasPrefix(serverPart[i+1:], ":") {
+			hostPart, portPart = serverPart[:i+1], serverPart[i+2:]
+		}
+	} else if i := strings.Index(serverPart, ":"); i != -1 {
+		hostPart, portPart = serverPart[:i], serverPart[i+1:]
+	}
+	if !strings.ContainsAny(portPart, ",-") || !portHopRe.MatchString(portPart) {
+		server, port = parseServerPortWithDefault(serverPart, 0)
+		return server, port, ""
+	}
+	server, _ = parseServerPortWithDefault(hostPart, 0)
+	// 不能只验证范围起点，否则后续越界或倒序端口仍会进入生成配置。
+	for _, span := range strings.Split(portPart, ",") {
+		previous := 0
+		for _, raw := range strings.Split(span, "-") {
+			n, err := strconv.Atoi(raw)
+			if err != nil || n < 1 || n > 65535 || n < previous {
+				return server, 0, ""
+			}
+			previous = n
+		}
+	}
+	first := strings.FieldsFunc(portPart, func(r rune) bool { return r == ',' || r == '-' })
+	port, _ = strconv.Atoi(first[0])
+	return server, port, portPart
 }
 
 func isIP(s string) bool {

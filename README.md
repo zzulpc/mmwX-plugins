@@ -1,5 +1,13 @@
 # 妙妙屋X 插件仓库
 
+## 项目交接入口
+
+- [当前状态与下一步](docs/项目状态.md)
+- [运行与新设备恢复](docs/运行与恢复.md)
+- [需要携带的文件及校验基线](docs/迁移文件清单.md)
+
+最新源码维护日期：2026-10-01。已完成本地兼容性同步与测速修复；详情及验证边界见状态页。历史交接章节保留各自日期。
+
 本仓库收录妙妙屋X（miaomiaowux）使用的共享模块、家用测速端和 Agent Skills。三个子项目互不依赖；仓库根目录不是 Go module，执行 Go 命令前请先进入对应子目录。
 
 ## 子项目
@@ -26,6 +34,12 @@ cd speedtest
 go build ./...
 go vet ./...
 go test ./... -count=1
+```
+
+技能工具清单与契约检查：
+
+```bash
+python3 -m unittest discover -s skills/scripts -p 'test_*.py' -v
 ```
 
 ## 许可证

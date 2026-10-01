@@ -27,11 +27,11 @@ func (p *ClashMetaProducer) GetType() string {
 
 // IP version mapping
 var ipVersionMapping = map[string]string{
-	"dual":       "dual",
-	"v4-only":    "ipv4",
-	"v6-only":    "ipv6",
-	"prefer-v4":  "ipv4-prefer",
-	"prefer-v6":  "ipv6-prefer",
+	"dual":      "dual",
+	"v4-only":   "ipv4",
+	"v6-only":   "ipv6",
+	"prefer-v4": "ipv4-prefer",
+	"prefer-v6": "ipv6-prefer",
 }
 
 // Produce converts proxies to ClashMeta format
@@ -42,48 +42,48 @@ func (p *ClashMetaProducer) Produce(proxies []Proxy, outputType string, opts *Pr
 
 	// Supported ciphers for Shadowsocks in ClashMeta
 	supportedSSCiphers := map[string]bool{
-		"aes-128-ctr":               true,
-		"aes-192-ctr":               true,
-		"aes-256-ctr":               true,
-		"aes-128-cfb":               true,
-		"aes-192-cfb":               true,
-		"aes-256-cfb":               true,
-		"aes-128-gcm":               true,
-		"aes-192-gcm":               true,
-		"aes-256-gcm":               true,
-		"aes-128-ccm":               true,
-		"aes-192-ccm":               true,
-		"aes-256-ccm":               true,
-		"aes-128-gcm-siv":           true,
-		"aes-256-gcm-siv":           true,
-		"chacha20-ietf":             true,
-		"chacha20":                  true,
-		"xchacha20":                 true,
-		"chacha20-ietf-poly1305":    true,
-		"xchacha20-ietf-poly1305":   true,
-		"chacha8-ietf-poly1305":     true,
-		"xchacha8-ietf-poly1305":    true,
-		"2022-blake3-aes-128-gcm":   true,
-		"2022-blake3-aes-256-gcm":   true,
+		"aes-128-ctr":                   true,
+		"aes-192-ctr":                   true,
+		"aes-256-ctr":                   true,
+		"aes-128-cfb":                   true,
+		"aes-192-cfb":                   true,
+		"aes-256-cfb":                   true,
+		"aes-128-gcm":                   true,
+		"aes-192-gcm":                   true,
+		"aes-256-gcm":                   true,
+		"aes-128-ccm":                   true,
+		"aes-192-ccm":                   true,
+		"aes-256-ccm":                   true,
+		"aes-128-gcm-siv":               true,
+		"aes-256-gcm-siv":               true,
+		"chacha20-ietf":                 true,
+		"chacha20":                      true,
+		"xchacha20":                     true,
+		"chacha20-ietf-poly1305":        true,
+		"xchacha20-ietf-poly1305":       true,
+		"chacha8-ietf-poly1305":         true,
+		"xchacha8-ietf-poly1305":        true,
+		"2022-blake3-aes-128-gcm":       true,
+		"2022-blake3-aes-256-gcm":       true,
 		"2022-blake3-chacha20-poly1305": true,
-		"lea-128-gcm":               true,
-		"lea-192-gcm":               true,
-		"lea-256-gcm":               true,
-		"rabbit128-poly1305":        true,
-		"aegis-128l":                true,
-		"aegis-256":                 true,
-		"aez-384":                   true,
-		"deoxys-ii-256-128":         true,
-		"rc4-md5":                   true,
-		"none":                      true,
+		"lea-128-gcm":                   true,
+		"lea-192-gcm":                   true,
+		"lea-256-gcm":                   true,
+		"rabbit128-poly1305":            true,
+		"aegis-128l":                    true,
+		"aegis-256":                     true,
+		"aez-384":                       true,
+		"deoxys-ii-256-128":             true,
+		"rc4-md5":                       true,
+		"none":                          true,
 	}
 
 	// Supported VMess ciphers for ClashMeta
 	supportedVMessCiphers := map[string]bool{
-		"auto":             true,
-		"none":             true,
-		"zero":             true,
-		"aes-128-gcm":      true,
+		"auto":              true,
+		"none":              true,
+		"zero":              true,
+		"aes-128-gcm":       true,
 		"chacha20-poly1305": true,
 	}
 
@@ -211,21 +211,8 @@ func (p *ClashMetaProducer) Produce(proxies []Proxy, outputType string, opts *Pr
 			}
 
 		case "wireguard":
-			// WireGuard keepalive
-			if !IsPresent(transformed, "keepalive") {
-				if IsPresent(transformed, "persistent-keepalive") {
-					transformed["keepalive"] = GetInt(transformed, "persistent-keepalive")
-				}
-			}
-			transformed["persistent-keepalive"] = GetInt(transformed, "keepalive")
-
-			// preshared-key
-			if !IsPresent(transformed, "preshared-key") {
-				if IsPresent(transformed, "pre-shared-key") {
-					transformed["preshared-key"] = GetString(transformed, "pre-shared-key")
-				}
-			}
-			transformed["pre-shared-key"] = GetString(transformed, "preshared-key")
+			// keepalive / preshared-key 两种写法互为别名,只在非零 / 非空时输出(见 normalizeWireGuardOptionalFields)
+			normalizeWireGuardOptionalFields(transformed)
 
 			// allowed-ips: 确保是数组类型
 			if IsPresent(transformed, "allowed-ips") {
@@ -364,10 +351,14 @@ func (p *ClashMetaProducer) Produce(proxies []Proxy, outputType string, opts *Pr
 		}
 
 		// Delete tls for certain proxy types
+		// 这些协议 TLS 是内建的,不该再往外写 tls 字段。上游陆续补进了
+		// trusttunnel / masque / shadowquic(b63f6084 等),我们这边缺了会多输出一个
+		// mihomo 不认的字段。
 		deleteTLSTypes := map[string]bool{
 			"trojan": true, "tuic": true, "hysteria": true,
 			"hysteria2": true, "juicity": true, "anytls": true,
-			"naive": true,
+			"naive": true, "trusttunnel": true, "masque": true,
+			"shadowquic": true,
 		}
 		if deleteTLSTypes[proxyType] {
 			delete(transformed, "tls")

@@ -17,7 +17,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -66,10 +65,12 @@ var pinnedMihomoAssets = map[string]mihomoAssetSpec{
 var mihomoVerRe = regexp.MustCompile(`v?(\d+)\.(\d+)\.(\d+)`)
 
 // probeMihomoVersion 运行 `<bin> -v`，同时区分“可执行但版本格式非标准”和“根本无法执行”。
-func probeMihomoVersion(bin string) (string, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+func probeMihomoVersion(parent context.Context, bin string) (string, bool) {
+	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, bin, "-v").CombinedOutput()
+	cmd := exec.CommandContext(ctx, bin, "-v")
+	cmd.WaitDelay = coreKillWaitLimit
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", false
 	}
@@ -100,8 +101,8 @@ func versionGTE(a, b string) bool {
 
 // mihomoSupportsSnell 检查 mihomo 版本 >= minMihomoVersion(确保支持 snell v4/v5)。
 // 命令能执行但版本解析不到时保守接受，避免误伤非标准构建；命令本身失败则必须拒绝。
-func mihomoSupportsSnell(bin string) bool {
-	v, executable := probeMihomoVersion(bin)
+func mihomoSupportsSnell(ctx context.Context, bin string) bool {
+	v, executable := probeMihomoVersion(ctx, bin)
 	if !executable {
 		return false
 	}
@@ -120,7 +121,7 @@ func mihomoBinName() string {
 }
 
 var (
-	mihomoMu       sync.Mutex // 串行化定位/下载,避免并发重复下载
+	mihomoMu       = newKernelMutex() // 串行化定位/下载,避免并发重复下载
 	cachedPath     string
 	mihomoCacheDir = defaultKernelCacheDir()
 )
@@ -160,11 +161,11 @@ func resolveKernelCacheDir(dataDir string) (string, error) {
 // legacyKernelPresent 仅在旧目录里至少有一个可运行内核时沿用，损坏占位文件不能绑住目录选择。
 func legacyKernelPresent(cacheDir string) bool {
 	mihomo := filepath.Join(cacheDir, mihomoBinName())
-	if fileExists(mihomo) && mihomoSupportsSnell(mihomo) {
+	if fileExists(mihomo) && mihomoSupportsSnell(context.Background(), mihomo) {
 		return true
 	}
 	singBox := filepath.Join(cacheDir, singBoxBinName())
-	return fileExists(singBox) && singBoxSupported(singBox)
+	return fileExists(singBox) && singBoxSupported(context.Background(), singBox)
 }
 
 // configureDataDir 在启动预热前一次性切换数据目录，并清空旧目录对应的定位缓存。
@@ -188,7 +189,9 @@ func configureDataDir(dataDir string) error {
 // $PATH → 从 GitHub 固定版本 Release 自动下载到数据目录。显式 MIHOMO_BIN 采用失败关闭，
 // 让内置内核的容器即使文件异常也不会偷偷回退到运行时网络下载。
 func EnsureMihomo(ctx context.Context) (string, error) {
-	mihomoMu.Lock()
+	if err := mihomoMu.LockContext(ctx); err != nil {
+		return "", err
+	}
 	defer mihomoMu.Unlock()
 
 	// 每个候选都要求版本支持 snell(>= minMihomoVersion),否则跳过、最终下载固定版本。
@@ -197,7 +200,10 @@ func EnsureMihomo(ctx context.Context) (string, error) {
 		if !fileExists(p) {
 			return "", fmt.Errorf("MIHOMO_BIN 指向的 mihomo 不存在: %s", p)
 		}
-		if !mihomoSupportsSnell(p) {
+		if !mihomoSupportsSnell(ctx, p) {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
 			return "", fmt.Errorf("MIHOMO_BIN 指向的 mihomo 不可执行或版本低于 %s: %s", minMihomoVersion, p)
 		}
 		cachedPath = p
@@ -207,13 +213,16 @@ func EnsureMihomo(ctx context.Context) (string, error) {
 		return cachedPath, nil
 	}
 	local := filepath.Join(mihomoCacheDir, mihomoBinName())
-	if fileExists(local) && mihomoSupportsSnell(local) {
+	if fileExists(local) && mihomoSupportsSnell(ctx, local) {
 		cachedPath = local
 		return local, nil
 	}
-	if p, err := exec.LookPath("mihomo"); err == nil && mihomoSupportsSnell(p) {
+	if p, err := exec.LookPath("mihomo"); err == nil && mihomoSupportsSnell(ctx, p) {
 		cachedPath = p
 		return p, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	// 自动下载已校验的固定版本。若缓存目录里是旧版会被覆盖。
 	if err := downloadMihomo(ctx, local); err != nil {

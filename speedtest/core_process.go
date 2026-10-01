@@ -291,3 +291,22 @@ func startProxyCore(ctx context.Context, runtimeInfo proxyRuntime, workdir, conf
 		}
 	}
 }
+
+// kernelMutex 的等待也受任务取消控制，防止已断线的任务卡在另一次内核准备之后。
+type kernelMutex struct{ slot chan struct{} }
+
+func newKernelMutex() *kernelMutex { return &kernelMutex{slot: make(chan struct{}, 1)} }
+func (m *kernelMutex) LockContext(ctx context.Context) error {
+	select {
+	case m.slot <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			m.Unlock()
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+func (m *kernelMutex) Lock()   { _ = m.LockContext(context.Background()) }
+func (m *kernelMutex) Unlock() { <-m.slot }

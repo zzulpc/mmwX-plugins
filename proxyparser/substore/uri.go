@@ -55,12 +55,27 @@ func uriEncodeComponent(s string) string {
 // uriEncodeUserInfo 编码 URI authority 中的用户名/密码。
 //
 // encodeURIComponent 会把 RFC 3986 明确允许出现在 userinfo 中的 sub-delims
-// （如 $、+、=）也编码成 %XX。虽然标准客户端应当解码，但部分代理客户端会把
+// （如 $、=）也编码成 %XX。虽然标准客户端应当解码，但部分代理客户端会把
 // 百分号编码后的文本直接当作密码，导致认证失败。这里保留合法 userinfo 字符，
 // 同时继续编码 @、/、?、#、% 等会改变 URI 结构或产生歧义的字符。
+//
+// '+' 例外,照样编成 %2B(与 encodeURIComponent 一致):按表单解码的导入端
+// (包括 proxyparser v0.2.7 及更早)会把字面 '+' 当成空格,2022 PSK / 密码
+// 导出后就导不回来(#885)。
 func uriEncodeUserInfo(s string) string {
+	return uriEscapeExcept(s, "-._~!$&'()*,;=:")
+}
+
+// uriEncodeTrojanPassword 同 uriEncodeUserInfo,但 '+' 保持字面量。trojan 的导入端都不按
+// 表单解码:≤v0.2.7 原样读,新版 / Sub-Store / mihomo 按 RFC 3986 解,编成 %2B 谁也不帮,
+// 只会让 ≤v0.2.7 读到 "%2B"(base64 风格的自定义密码最常见)。
+func uriEncodeTrojanPassword(s string) string {
+	return uriEscapeExcept(s, "-._~!$&'()*+,;=:")
+}
+
+// uriEscapeExcept 把字母数字和 safe 以外的字节都写成 %XX。
+func uriEscapeExcept(s, safe string) string {
 	const upperhex = "0123456789ABCDEF"
-	const safe = "-._~!$&'()*+,;=:"
 	var b strings.Builder
 	for i := 0; i < len(s); i++ {
 		c := s[i]
@@ -378,22 +393,19 @@ func (p *URIProducer) encodeVMess(proxy Proxy) (string, error) {
 				}
 			}
 		default:
-			// ws, http, h2, etc.
 			if opts := GetMap(proxy, network+"-opts"); opts != nil {
-				if path := opts["path"]; path != nil {
-					if pathSlice, ok := path.([]interface{}); ok && len(pathSlice) > 0 {
-						config["path"] = fmt.Sprintf("%v", pathSlice[0])
-					} else if pathStr, ok := path.(string); ok {
-						config["path"] = pathStr
-					}
+				// URI 入口的 []string 与 YAML 入口的 []any 都必须保留，H2 的 Host 在顶层。
+				if path := valueutil.FirstString(opts["path"]); path != "" {
+					config["path"] = path
 				}
 				if headers := GetMap(opts, "headers"); headers != nil {
-					if host := headers["Host"]; host != nil {
-						if hostSlice, ok := host.([]interface{}); ok && len(hostSlice) > 0 {
-							config["host"] = fmt.Sprintf("%v", hostSlice[0])
-						} else if hostStr, ok := host.(string); ok {
-							config["host"] = hostStr
-						}
+					if host := valueutil.FirstString(headers["Host"]); host != "" {
+						config["host"] = host
+					}
+				}
+				if network == "h2" {
+					if hosts := GetStringSlice(opts, "host"); len(hosts) > 0 {
+						config["host"] = strings.Join(hosts, ",")
 					}
 				}
 			}
@@ -781,8 +793,9 @@ func (p *URIProducer) encodeTrojan(proxy Proxy) (string, error) {
 	// 注: JS trojan 不输出 udp 参数, 故此处不再追加 (此前 Go 多输出 udp, 已纠正)。
 
 	// fragment 用 uriEncodeComponent 对齐 JS encodeURIComponent(proxy.name)。
+	// password 要编码: 导入端会解 %XX, 原样拼接时含 '%'/'#'/'?' 的密码导不回来。
 	uri := fmt.Sprintf("trojan://%s@%s:%d?%s#%s",
-		password, server, port, params.Encode(), uriEncodeComponent(name))
+		uriEncodeTrojanPassword(password), server, port, params.Encode(), uriEncodeComponent(name))
 	return uri, nil
 }
 
@@ -1046,6 +1059,9 @@ func (p *URIProducer) encodeHysteria2(proxy Proxy) (string, error) {
 // encodeHysteria encodes Hysteria proxy to hysteria:// URI (completely rewritten to match frontend)
 func (p *URIProducer) encodeHysteria(proxy Proxy) (string, error) {
 	server := GetString(proxy, "server")
+	if strings.Contains(server, ":") && !strings.HasPrefix(server, "[") {
+		server = "[" + server + "]"
+	}
 	port := GetInt(proxy, "port")
 	name := GetString(proxy, "name")
 
@@ -1069,7 +1085,7 @@ func (p *URIProducer) encodeHysteria(proxy Proxy) (string, error) {
 		switch key {
 		case "alpn":
 			if alpn := GetStringSlice(proxy, "alpn"); len(alpn) > 0 {
-				hysteriaParams = append(hysteriaParams, "alpn="+uriEncodeComponent(alpn[0]))
+				hysteriaParams = append(hysteriaParams, "alpn="+uriEncodeComponent(strings.Join(alpn, ",")))
 			} else if s := valueutil.FirstString(val); s != "" {
 				hysteriaParams = append(hysteriaParams, "alpn="+uriEncodeComponent(s))
 			}
@@ -1091,19 +1107,19 @@ func (p *URIProducer) encodeHysteria(proxy Proxy) (string, error) {
 				}
 			}
 		case "ports":
-			hysteriaParams = append(hysteriaParams, fmt.Sprintf("mport=%v", val))
+			hysteriaParams = append(hysteriaParams, "mport="+uriEncodeComponent(fmt.Sprint(val)))
 		case "auth-str":
-			hysteriaParams = append(hysteriaParams, fmt.Sprintf("auth=%v", val))
+			hysteriaParams = append(hysteriaParams, "auth="+uriEncodeComponent(fmt.Sprint(val)))
 		case "up":
-			hysteriaParams = append(hysteriaParams, fmt.Sprintf("upmbps=%v", val))
+			hysteriaParams = append(hysteriaParams, "upmbps="+uriEncodeComponent(fmt.Sprint(val)))
 		case "down":
-			hysteriaParams = append(hysteriaParams, fmt.Sprintf("downmbps=%v", val))
+			hysteriaParams = append(hysteriaParams, "downmbps="+uriEncodeComponent(fmt.Sprint(val)))
 		case "_obfs":
-			hysteriaParams = append(hysteriaParams, fmt.Sprintf("obfs=%v", val))
+			hysteriaParams = append(hysteriaParams, "obfs="+uriEncodeComponent(fmt.Sprint(val)))
 		case "obfs":
-			hysteriaParams = append(hysteriaParams, fmt.Sprintf("obfsParam=%v", val))
+			hysteriaParams = append(hysteriaParams, "obfsParam="+uriEncodeComponent(fmt.Sprint(val)))
 		case "sni":
-			hysteriaParams = append(hysteriaParams, fmt.Sprintf("peer=%v", val))
+			hysteriaParams = append(hysteriaParams, "peer="+uriEncodeComponent(fmt.Sprint(val)))
 		default:
 			// JS: else if (proxy[key] && !/^_/i.test(key))
 			// 仅处理 truthy 且非下划线前缀; key.replace(/-/,'_') 只替换首个连字符。
@@ -1267,6 +1283,29 @@ func (p *URIProducer) encodeHTTP(proxy Proxy) (string, error) {
 	return uri, nil
 }
 
+// wireGuardURIParamValue 把 WG 参数值转成 URI 里的字符串。列表(allowed-ips / reserved / dns)
+// 用逗号连接,与前端 encodeURIComponent(数组) 一致;以前用 %v 写成 "[0.0.0.0/0 ::/0]",
+// 导回来是一个坏网段,reserved 也凑不齐 3 段被丢掉。
+func wireGuardURIParamValue(val interface{}) string {
+	switch list := val.(type) {
+	case []interface{}:
+		parts := make([]string, 0, len(list))
+		for _, item := range list {
+			parts = append(parts, fmt.Sprintf("%v", item))
+		}
+		return strings.Join(parts, ",")
+	case []string:
+		return strings.Join(list, ",")
+	case []int:
+		parts := make([]string, 0, len(list))
+		for _, item := range list {
+			parts = append(parts, fmt.Sprintf("%d", item))
+		}
+		return strings.Join(parts, ",")
+	}
+	return fmt.Sprintf("%v", val)
+}
+
 // encodeWireGuard encodes WireGuard proxy to wireguard:// URI (matches frontend)
 func (p *URIProducer) encodeWireGuard(proxy Proxy) (string, error) {
 	server := GetString(proxy, "server")
@@ -1301,6 +1340,18 @@ func (p *URIProducer) encodeWireGuard(proxy Proxy) (string, error) {
 		if strings.HasPrefix(key, "_") {
 			continue
 		}
+		// 可选字段只在非零时输出(与 clash 系 producer 口径一致):mtu / 保活为 0 没有意义,
+		// 全 0 的 reserved 等于没配。
+		switch key {
+		case "mtu", "keepalive", "persistent-keepalive":
+			if GetInt(proxy, key) <= 0 {
+				continue
+			}
+		case "reserved":
+			if wireGuardReservedIsZero(val) {
+				continue
+			}
+		}
 		if key == "udp" {
 			if udpBool, ok := val.(bool); ok {
 				if udpBool {
@@ -1310,13 +1361,26 @@ func (p *URIProducer) encodeWireGuard(proxy Proxy) (string, error) {
 				}
 			}
 		} else if val != nil && val != "" {
-			params.Set(key, fmt.Sprintf("%v", val))
+			params.Set(key, wireGuardURIParamValue(val))
 		}
 	}
 
+	// 名字里的 '+' 也转义:PathEscape 不转义它,按表单解码的导入端会把它当空格
+	// (与前端 encodeURIComponent 的输出一致)。
+	fragment := strings.ReplaceAll(url.PathEscape(name), "+", "%2B")
 	uri := fmt.Sprintf("wireguard://%s@%s:%d/?%s#%s",
-		url.PathEscape(privateKey), server, port, params.Encode(), url.PathEscape(name))
+		url.PathEscape(privateKey), server, port, params.Encode(), fragment)
 	return uri, nil
+}
+
+// wireGuardReservedIsZero 判断 reserved 是否全 0([0,0,0] / "0,0,0" 与不配等价)。
+func wireGuardReservedIsZero(val interface{}) bool {
+	for _, part := range strings.Split(wireGuardURIParamValue(val), ",") {
+		if strings.TrimSpace(part) != "0" {
+			return false
+		}
+	}
+	return true
 }
 
 // encodeAnyTLS encodes AnyTLS proxy to anytls:// URI (matches frontend)
@@ -1341,6 +1405,20 @@ func (p *URIProducer) encodeAnyTLS(proxy Proxy) (string, error) {
 	// client-fingerprint (frontend line 766-768)
 	if fp := GetString(proxy, "client-fingerprint"); fp != "" {
 		params.Set("fp", fp)
+	}
+
+	// REALITY: Sub-Store 的 anytls 分支是复用 vless 生成器再把 scheme 换回来,
+	// 借此带出 security/pbk/sid。这里不改既有 URI 形态, 只补齐这三个参数, 保证
+	// AnyTLS+REALITY 节点经 uri/v2ray 订阅导出后仍能被 parseAnytlsURL 还原,
+	// 否则往返一趟 REALITY 就丢了。
+	if realityOpts := GetMap(proxy, "reality-opts"); realityOpts != nil {
+		params.Set("security", "reality")
+		if pubKey := GetString(realityOpts, "public-key"); pubKey != "" {
+			params.Set("pbk", pubKey)
+		}
+		if shortID := GetString(realityOpts, "short-id"); shortID != "" {
+			params.Set("sid", shortID)
+		}
 	}
 
 	// ALPN (frontend line 771-773)

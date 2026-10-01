@@ -12,6 +12,10 @@ import (
 type SingboxProducer struct {
 	producerType string
 	helper       *ProxyHelper
+	// includeUnsupported 记住本次 Produce 的 include-unsupported-proxy 开关。
+	// sing-box 有一批字段只有非官方版认(client_name / quic_proxy_mode / certificate_server_name),
+	// 上游把它们挂在这个开关后面,官方版才不会收到不认识的字段。
+	includeUnsupported bool
 }
 
 // NewSingboxProducer creates a new sing-box producer
@@ -44,6 +48,7 @@ func (p *SingboxProducer) Produce(proxies []Proxy, outputType string, opts *Prod
 	if opts == nil {
 		opts = &ProduceOptions{}
 	}
+	p.includeUnsupported = opts.IncludeUnsupportedProxy
 
 	// First, convert proxies to ClashMeta format (internal)
 	clashMetaProducer := NewClashMetaProducer()
@@ -154,7 +159,11 @@ func (p *SingboxProducer) Produce(proxies []Proxy, outputType string, opts *Prod
 		}
 
 		if parsed != nil {
-			p.passthroughExtraFields(proxy, parsed)
+			// WG endpoint 不透传:它的字段集合和出站完全不同(见 singboxWireGuardEndpointKeys),
+			// 导入节点里认不出的参数一旦透传,官方 sing-box 会整份拒载。
+			if proxyType != "wireguard" {
+				p.passthroughExtraFields(proxy, parsed)
+			}
 			list = append(list, parsed)
 		}
 	}
@@ -240,6 +249,14 @@ func (p *SingboxProducer) tfoParser(proxy Proxy, parsed map[string]interface{}) 
 
 // singboxConsumedKeys are standard Clash proxy fields already handled by specific parsers.
 var singboxConsumedKeys = map[string]bool{
+	// 下面这几个由各自的 parser 显式处理(值要做类型归一,client_name /
+	// quic_proxy_mode / certificate_server_name 还只给非官方版)。
+	// 不列进来的话 passthroughExtraFields 会把 a-b 无脑转成 a_b 原样塞出去 ——
+	// 官方版 sing-box 收到不认识的字段会直接拒绝加载。
+	"client-name": true, "client-metadata": true,
+	"bbr-profile": true, "disable-chrome-parrot": true,
+	"quic-proxy-mode": true, "name-cert-verify": true,
+
 	"name": true, "type": true, "server": true, "port": true,
 	"password": true, "uuid": true, "cipher": true, "alterId": true,
 	"network": true, "tls": true, "skip-cert-verify": true,
@@ -259,7 +276,7 @@ var singboxConsumedKeys = map[string]bool{
 	"ca": true, "ca-str": true, "ca_str": true,
 	"recv-window-conn": true, "recv-window": true, "recv_window_conn": true, "recv_window": true,
 	"disable-mtu-discovery": true,
-	"obfs-password": true, "ports": true, "hop-interval": true,
+	"obfs-password":         true, "ports": true, "hop-interval": true,
 	"congestion-controller": true, "udp-relay-mode": true,
 	"reduce-rtt": true, "heartbeat-interval": true,
 	"ip": true, "ipv6": true, "public-key": true, "private-key": true,
@@ -270,7 +287,7 @@ var singboxConsumedKeys = map[string]bool{
 	"headers": true, "path": true,
 	"version": true, "token": true,
 	"idle-timeout": true, "padding": true,
-	"encryption": true,
+	"encryption":   true,
 	"udp-over-tcp": true, "udp-over-tcp-version": true,
 	"insecure": true, "peer": true, "disable-sni": true,
 	"ech-opts": true, "server-fingerprint": true,
@@ -661,8 +678,15 @@ func (p *SingboxProducer) grpcParser(proxy Proxy, parsed map[string]interface{})
 }
 
 func (p *SingboxProducer) tlsParser(proxy Proxy, parsed map[string]interface{}) {
-	tls := map[string]interface{}{
-		"enabled": false,
+	// 对齐 Sub-Store: 在各 parser 预置的 parsedProxy.tls 上原地叠加, 而不是从零构造。
+	// trojan/naive/hysteria/hysteria2/tuic/anytls 天生走 TLS, 由各自 parser 预置
+	// enabled:true; 若在这里重置回 false, 末尾就写不回去, sni/reality/alpn 全丢。
+	// 注意 ClashMeta 中间层会对这些类型 delete proxy.tls, 所以不能依赖 proxy["tls"]。
+	tls, _ := parsed["tls"].(map[string]interface{})
+	if tls == nil {
+		tls = map[string]interface{}{
+			"enabled": false,
+		}
 	}
 
 	if GetBool(proxy, "tls") {
@@ -794,9 +818,11 @@ func (p *SingboxProducer) tlsParser(proxy Proxy, parsed map[string]interface{}) 
 		tls["client_key_path"] = client_key_path
 	}
 
-	// Only add tls if enabled
-	if tls["enabled"].(bool) {
+	// Only add tls if enabled (对齐 Sub-Store 的 delete parsedProxy.tls)
+	if enabled, _ := tls["enabled"].(bool); enabled {
 		parsed["tls"] = tls
+	} else {
+		delete(parsed, "tls")
 	}
 }
 
@@ -1010,6 +1036,19 @@ func (p *SingboxProducer) shadowTLSParser(proxy Proxy) (map[string]interface{}, 
 				"fingerprint": GetString(proxy, "client-fingerprint"),
 			},
 		},
+	}
+
+	// shadow-tls 的 TLS 子项:insecure(官方版就认)与 certificate_server_name
+	// (只有非官方版认)。上游 25d10771。
+	if stTLS, ok := stPart["tls"].(map[string]interface{}); ok {
+		if GetBool(proxy, "skip-cert-verify") {
+			stTLS["insecure"] = true
+		}
+		if p.includeUnsupported {
+			if v := GetString(proxy, "name-cert-verify"); v != "" {
+				stTLS["certificate_server_name"] = v
+			}
+		}
 	}
 
 	if GetBool(proxy, "fast-open") {
@@ -1520,6 +1559,14 @@ func (p *SingboxProducer) hysteria2Parser(proxy Proxy) (map[string]interface{}, 
 		}
 	}
 
+	// 上游 810ca5de:HY2 的 bbr_profile / disable_chrome_parrot。节点字段用连字符写法。
+	if v := GetString(proxy, "bbr-profile"); v != "" {
+		parsed["bbr_profile"] = v
+	}
+	if GetBool(proxy, "disable-chrome-parrot") {
+		parsed["disable_chrome_parrot"] = true
+	}
+
 	p.networkParser(proxy, parsed)
 	p.tlsParser(proxy, parsed)
 	p.tfoParser(proxy, parsed)
@@ -1620,6 +1667,18 @@ func (p *SingboxProducer) anytlsParser(proxy Proxy) (map[string]interface{}, err
 	if minIdleSession := GetString(proxy, "min-idle-session"); minIdleSession != "" {
 		if matched, _ := regexp.MatchString(`^\d+$`, minIdleSession); matched {
 			parsed["min_idle_session"], _ = strconv.Atoi(minIdleSession)
+		}
+	}
+
+	// client_metadata:官方版就支持(上游 a4c8741d)。节点字段是 client-metadata。
+	if v := GetString(proxy, "client-metadata"); v != "" {
+		parsed["client_metadata"] = v
+	}
+	// client_name:只有非官方版认(上游 95958c85),跟其它非官方字段一样挂在
+	// include-unsupported-proxy 后面,免得官方版收到不认识的字段。
+	if p.includeUnsupported {
+		if v := GetString(proxy, "client-name"); v != "" {
+			parsed["client_name"] = v
 		}
 	}
 
@@ -1764,7 +1823,8 @@ func (p *SingboxProducer) wireguardParser(proxy Proxy) (map[string]interface{}, 
 
 	// Ensure peers exist
 	peersSlice, _ := proxy["peers"].([]interface{})
-	if len(peersSlice) == 0 {
+	singlePeer := len(peersSlice) == 0
+	if singlePeer {
 		peersSlice = []interface{}{map[string]interface{}{}}
 	}
 
@@ -1804,6 +1864,10 @@ func (p *SingboxProducer) wireguardParser(proxy Proxy) (map[string]interface{}, 
 		if allowedIPs == nil {
 			allowedIPs = GetStringSlice(peerMap, "allowed_ips")
 		}
+		if allowedIPs == nil && singlePeer {
+			// 单 peer 写法(mihomo 顶层字段)的 allowed-ips 也在顶层,以前被忽略、一律回落默认值
+			allowedIPs = wireGuardAllowedIPs(proxy["allowed-ips"])
+		}
 		if allowedIPs == nil {
 			allowedIPs = []string{"0.0.0.0/0"}
 			if GetString(proxy, "ipv6") != "" {
@@ -1812,16 +1876,23 @@ func (p *SingboxProducer) wireguardParser(proxy Proxy) (map[string]interface{}, 
 		}
 
 		peer := map[string]interface{}{
-			"address":    peerServer,
-			"port":       peerPort,
-			"public_key": publicKey,
+			"address":     peerServer,
+			"port":        peerPort,
+			"public_key":  publicKey,
 			"allowed_ips": allowedIPs,
 		}
 		if preSharedKey != "" {
 			peer["pre_shared_key"] = preSharedKey
 		}
 
-		if keepalive := GetInt(peerMap, "persistent-keepalive-interval"); keepalive > 0 {
+		// 保活:peer 自己的 persistent-keepalive-interval 优先,否则用顶层
+		// persistent-keepalive / keepalive(mihomo 的顶层值对所有 peer 生效)。
+		// sing-box 只在 peers[].persistent_keepalive_interval 认这个值(uint16),顶层没有对应字段。
+		keepalive := GetInt(peerMap, "persistent-keepalive-interval")
+		if keepalive <= 0 {
+			keepalive = wireGuardKeepalive(proxy)
+		}
+		if keepalive > 0 && keepalive <= 65535 {
 			peer["persistent_keepalive_interval"] = keepalive
 		}
 
@@ -1837,19 +1908,42 @@ func (p *SingboxProducer) wireguardParser(proxy Proxy) (map[string]interface{}, 
 	}
 	parsed["peers"] = peers
 
-	p.networkParser(proxy, parsed)
 	p.tfoParser(proxy, parsed)
 	p.detourParser(proxy, parsed)
-	p.smuxParser(proxy, parsed)
 	p.ipVersionParser(proxy, parsed)
+	p.domainResolverParser(proxy, parsed)
 
-	delete(parsed, "server")
-	delete(parsed, "server_port")
-	delete(parsed, "pre_shared_key")
-	delete(parsed, "peer_public_key")
-	delete(parsed, "reserved")
+	// 只留 sing-box WG endpoint 认识的字段。旧的 server/server_port/peer_public_key/
+	// pre_shared_key/reserved(出站写法,1.13 起已移除)、network、multiplex 都不在其中,
+	// 写出去官方 sing-box 会整份拒载。
+	for key := range parsed {
+		if !singboxWireGuardEndpointKeys[key] {
+			delete(parsed, key)
+		}
+	}
 
 	return parsed, nil
+}
+
+// singboxWireGuardEndpointKeys 是 sing-box WireGuard endpoint 允许的全部顶层字段:
+// Endpoint 的 type/tag + WireGuardEndpointOptions + DialerOptions
+// (sing-box option/endpoint.go、option/wireguard.go、option/outbound.go 的 DialerOptions)。
+// peers[] 的字段由 wireguardParser 逐个显式构造,只有 address/port/public_key/
+// pre_shared_key/allowed_ips/persistent_keepalive_interval/reserved。
+var singboxWireGuardEndpointKeys = map[string]bool{
+	// Endpoint
+	"type": true, "tag": true,
+	// WireGuardEndpointOptions
+	"system": true, "name": true, "mtu": true, "address": true, "private_key": true,
+	"listen_port": true, "peers": true, "udp_timeout": true, "udp_mapping": true,
+	"udp_filtering": true, "udp_nat_max": true, "workers": true,
+	// DialerOptions
+	"detour": true, "bind_interface": true, "inet4_bind_address": true, "inet6_bind_address": true,
+	"bind_address_no_port": true, "protect_path": true, "routing_mark": true, "reuse_addr": true,
+	"netns": true, "connect_timeout": true, "tcp_fast_open": true, "tcp_multi_path": true,
+	"disable_tcp_keep_alive": true, "tcp_keep_alive": true, "tcp_keep_alive_interval": true,
+	"udp_fragment": true, "domain_resolver": true, "network_strategy": true, "network_type": true,
+	"fallback_network_type": true, "fallback_delay": true, "domain_strategy": true,
 }
 
 func parseReserved(reserved interface{}) interface{} {
@@ -1920,6 +2014,11 @@ func (p *SingboxProducer) snellParser(proxy Proxy) (map[string]interface{}, erro
 	}
 	if GetBool(proxy, "reuse") && (version == 0 || version >= 4) {
 		parsed["reuse"] = true
+	}
+	// quic_proxy_mode:Snell v6 的字段,只有 sing-box 非官方版认(上游 30b9113d)。
+	// 节点字段是 quic-proxy-mode。
+	if p.includeUnsupported && GetBool(proxy, "quic-proxy-mode") {
+		parsed["quic_proxy_mode"] = true
 	}
 	p.networkParser(proxy, parsed)
 	if GetBool(proxy, "fast-open") {

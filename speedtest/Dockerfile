@@ -6,7 +6,7 @@
 #     -e MMWX_SPEEDTEST_TOKEN=<token> \
 #     -e MMWX_SPEEDTEST_NAME=home-tester \
 #     -v mmwx-speedtester-data:/data \
-#     ghcr.io/zzulpc/mmwx-speedtester:0.2.6
+#     ghcr.io/zzulpc/mmwx-speedtester:0.2.7
 #
 # Mihomo 与 sing-box 都固定在镜像内；已有 /data 卷可继续挂载，但不再负责提供代理内核。
 # 容器运行期只需访问主控 WS 与测速目标，不需要连接 GitHub 下载内核。

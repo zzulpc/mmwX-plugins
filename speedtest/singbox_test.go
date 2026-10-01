@@ -216,7 +216,7 @@ func installedTestSingBox(t *testing.T) string {
 			t.Skip("本机未安装 sing-box，跳过官方内核配置校验")
 		}
 	}
-	if !singBoxSupported(bin) {
+	if !singBoxSupported(context.Background(), bin) {
 		t.Skip("本机 sing-box 版本低于 1.14，跳过 Snell v6 配置校验")
 	}
 	return bin

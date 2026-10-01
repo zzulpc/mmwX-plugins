@@ -375,7 +375,7 @@ func TestDataDir不沿用损坏旧内核(t *testing.T) {
 	if got != defaultKernelCacheDir() {
 		t.Fatalf("损坏旧内核错误绑定了旧目录: got=%q want=%q", got, defaultKernelCacheDir())
 	}
-	if mihomoSupportsSnell(damaged) {
+	if mihomoSupportsSnell(context.Background(), damaged) {
 		t.Fatal("损坏旧内核被判定为可用")
 	}
 }

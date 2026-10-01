@@ -1,5 +1,12 @@
 # AGENTS.md
 
+## 项目接手与持续记录
+
+- 接续项目时先读 [docs/项目状态.md](docs/项目状态.md) 的相关部分；局部任务直接读取目标文件及适用规则。涉及运行、部署或恢复时再读[运行与恢复](docs/运行与恢复.md)，涉及迁移、文件布局或外部依赖时再读[迁移文件清单](docs/迁移文件清单.md)。
+- 状态页是带日期的摘要；按本次动作核对实际文件、版本、数据或机器状态，说明差异，不把历史计划当成当前验收。
+- 仅在项目状态、关键决定、验证结果或后续事项变化时更新状态入口；文件布局或依赖变化时同步迁移清单。只读核对、局部文字调整无需制造状态记录。
+- 保留版本化历史证据；交接摘要只记必要结论，不复制旧对话、患者级原始资料或凭据。业务闸门与当前任务授权继续适用；恢复资料整理不等于实际恢复通过。
+
 给在本仓库工作的编码 agent 的说明。
 
 ## 仓库是什么
@@ -35,15 +42,17 @@ cd proxyparser && go build ./... && go vet ./... && go test ./... -count=1
 cd speedtest && go build ./... && go vet ./... && go test ./... -count=1
 ```
 
-基线（2026-09-05，Go 1.26.8，与发布工具链一致）：两者都干净通过，`go vet` 无告警。
-覆盖率（`go test ./... -cover -count=1`）：`proxyparser` 44.5%、
-`proxyparser/internal/valueutil` 74.2%、`proxyparser/substore` 40.5%、`speedtest` 70.6%
-（本次未启用可选的已安装 sing-box 校验；启用这些用例时应单独记录覆盖率）。
+基线（2026-10-01，darwin/arm64，Go 1.26.8，与发布工具链一致）：两者都干净通过，`go vet` 无告警。
+覆盖率（`go test ./... -cover -count=1`）：`proxyparser` 67.9%、
+`proxyparser/internal/valueutil` 74.2%、`proxyparser/substore` 54.6%、`speedtest` 70.8%
+（parser 仍有 4 个既有跳过用例；本机跳过 Windows 安装测试和 2 个可选的已安装
+sing-box 校验；启用这些用例时应单独记录覆盖率）。
 请在同一 Go 工具链下比较覆盖率，不要直接与旧 Go 1.27.0 基线混用；跨包往返测试
 位于 `proxyparser/roundtrip`，其调用默认不计入被调用包的覆盖率。
 **改完测试顺手把这几个数对一遍**，基线错了会让人误以为新加的测试没生效。
 
-**改完代码必须自己跑上面的命令**，不要只说「应该没问题」。
+**修改哪个 Go module，就运行该 module 上述构建和测试命令**；涉及两个 module 时分别运行。仅修改 Skills 或文档时检查指令、引用与示例，不因此运行两个 module 的全套测试。
+修改技能工具引用或清单脚本时运行 `python3 -m unittest discover -s skills/scripts -p 'test_*.py' -v`，同时维护 `skills/tool-capabilities.json` 与 README 允许名单。
 
 `speedtest` 的测试不需要真的起 mihomo / sing-box，也不要在测试里下载内核或访问外网。
 
@@ -98,9 +107,9 @@ CDN 回源 Host 头被静默丢掉；对应双入口回归测试在 `proxyparser
 - `speedtest` 的发布由 tag `speedtest-vX.Y.Z` 触发 `.github/workflows/speedtest.yml`。
 - `speedtest/VERSION` 的内容会 `//go:embed` 进二进制并上报给主控，**必须与 tag 版本一致**。
 - `speedtest/scripts/release.sh` 会 bump 版本、改 changelog、打 tag 并 push。
-  **agent 不要执行这个脚本**，它会真的推送到远端。
+  仅在用户已明确授权对应版本的发布与推送后使用；执行前核对脚本、版本、变更、测试和目标远端。已有发布授权无须再次确认；普通修复或审阅请求不隐含发布授权。
 
 ## 任务边界
 
 仓库不保留已经执行完毕的一次性审计计划。新任务以当前用户请求或 Issue 为准；
-**一个任务一个 commit**，任务里写了「不要动」的文件就真的别动。
+只有用户要求或已授权提交时才创建 commit，按一个完整变更组织提交；审阅和未要求提交的修复不自动提交。只暂存本次改动，保留已有修改，遵守用户指定的不可修改路径。

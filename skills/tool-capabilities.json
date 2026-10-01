@@ -1,0 +1,32 @@
+{
+  "baseline_version": "v0.4.9",
+  "optional_tools": [
+    "cert_create",
+    "cert_deploy",
+    "cert_list",
+    "cert_list_valid",
+    "cert_renew",
+    "cert_self_signed",
+    "forward_chain_apply",
+    "forward_chain_bind_node",
+    "forward_chain_connections",
+    "forward_chain_create",
+    "forward_chain_create_node",
+    "forward_chain_get",
+    "forward_chain_list",
+    "forward_chain_set_hops",
+    "forward_chain_set_limit",
+    "forward_group_create",
+    "forward_group_get",
+    "forward_group_list",
+    "forward_metrics",
+    "forward_status",
+    "logs_agent",
+    "logs_agent_files",
+    "logs_system",
+    "package_assignment_list",
+    "package_assignment_upsert",
+    "server_routing_update",
+    "task_runs"
+  ]
+}

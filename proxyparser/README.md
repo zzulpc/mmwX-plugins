@@ -29,7 +29,7 @@ go get github.com/zzulpc/mmwX-plugins/proxyparser
 | WireGuard | `wireguard://`、`wg://` |
 | HTTP 代理 | `http://`、`https://` |
 | NaiveProxy | `naive://`、`naive+http://`、`naive+https://` |
-| Mieru | `mieru://` |
+| Mieru | `mieru://`、`mierus://` |
 | Snell | `snell://` |
 
 ## 解析单条 URI
@@ -157,3 +157,14 @@ go build ./...
 go vet ./...
 go test ./... -count=1
 ```
+
+## 2026-10-01 兼容性更新
+
+已参考上游截至 `ab5e17ea22a2b430621a6b0c1da5cd8ed6a25871` 的变更，保留本仓库的规范模块路径与既有修复。来源和验证记录见[项目状态](../docs/项目状态.md)。
+
+- URI 凭据保留字面加号，查询参数采用表单解码；补齐 Hysteria 1 的 `auth-str`/混淆字段、VMess H2 Host、AnyTLS REALITY 和 WireGuard 字段往返。
+- WireGuard 在 sing-box 的 endpoint/peer 层级输出；补齐隐式 TLS 的 SNI、各客户端字段及支持协议。客户端自身支持范围仍需以实际版本验证。
+- V3 模板支持嵌套 YAML 合并与别名，保留显式内置出站。缺失的代理集合、无法等价转换的筛选表达式会报错，不扩大节点选择范围。
+- Surge、Shadowrocket 与 Loon 完整配置会清理已知未输出的节点引用；规则或代理链因此失效时返回错误，不自动改成直连。调用方需显式选择替代策略。
+- `BuildLoonKeleeConfigWithPolicies` 保留接口，但仅提供一个外部组名不足以还原它的成员；引用模板中不存在的组会报错。需要完整组定义时使用 `BuildCompleteLoonConfig`，或在模板确实含该组时使用 `BuildLoonProxySections`。
+- `SetLoonRuleSetResolver` 支持调用方提供规则集解析结果；解析器本身不联网下载规则集。无法转换的规则在输出中明确标注，不能据生成成功推断与来源规则完全等价。

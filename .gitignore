@@ -3,3 +3,7 @@ speedtest/speedtest
 build/
 .DS_Store
 *.out
+
+# Python 技能检查的本地解释器缓存
+__pycache__/
+*.pyc

@@ -443,21 +443,58 @@ func BuildCompleteSurgeConfig(
 		IncludeUnsupportedProxy: includeUnsupported,
 	}
 
+	// 记下实际输出了哪些节点:不支持的类型(WireGuard 等)被跳过后,组 / 规则 /
+	// underlying-proxy 里指向它们的名字要一并清理(见 policy_prune.go)。
+	type surgeProxyLine struct{ line, underlying string }
+	var lines []surgeProxyLine
+	inputNames := make([]string, 0, len(proxies))
+	outputNames := make(map[string]bool, len(proxies))
 	for _, proxy := range proxies {
-		line, err := surgeProducer.ProduceOne(proxy, "", opts)
+		// 取原名:ProduceOne 会清洗名字里的 = 和 ,,而组里引用的是原名
+		name := GetString(proxy, "name")
+		inputNames = append(inputNames, name)
+		renderProxy, underlying, err := prepareSurgeChain(proxy)
 		if err != nil {
+			return "", err
+		}
+		line, err := surgeProducer.ProduceOne(renderProxy, "", opts)
+		if err != nil || line == "" {
 			// Skip unsupported proxies
 			continue
 		}
-		if line != "" {
-			proxyBuilder.WriteString("\n")
-			proxyBuilder.WriteString(line)
+		outputNames[name] = true
+		lines = append(lines, surgeProxyLine{line: line, underlying: underlying})
+	}
+
+	groupRefs := make([]policyGroupMembers, len(clashConfig.ProxyGroups))
+	for i, g := range clashConfig.ProxyGroups {
+		groupRefs[i] = policyGroupMembers{Name: g.Name, Members: g.Proxies}
+	}
+	pruned := prunePolicyGroups(groupRefs, inputNames, outputNames)
+
+	for _, l := range lines {
+		line := l.line
+		if l.underlying != "" && pruned.Dangling(l.underlying) {
+			return "", fmt.Errorf("前置代理 %q 未输出，无法保留代理链", l.underlying)
 		}
+		if l.underlying != "" {
+			line += ",underlying-proxy=" + l.underlying
+		}
+		proxyBuilder.WriteString("\n")
+		proxyBuilder.WriteString(line)
 	}
 	sections = append(sections, proxyBuilder.String())
 
-	// 3. Build Proxy Group section
-	aclGroups := ConvertClashProxyGroupsToSurge(clashConfig.ProxyGroups)
+	// 3. Build Proxy Group section(被剔空的组整组删掉,其余组去掉悬空成员)
+	keptGroups := make([]ClashProxyGroup, 0, len(clashConfig.ProxyGroups))
+	for i, g := range clashConfig.ProxyGroups {
+		if pruned.Removed[g.Name] {
+			continue
+		}
+		g.Proxies = pruned.Members[i]
+		keptGroups = append(keptGroups, g)
+	}
+	aclGroups := ConvertClashProxyGroupsToSurge(keptGroups)
 	proxyGroupSection := GenerateSurgeProxyGroups(aclGroups, false)
 	sections = append(sections, proxyGroupSection)
 
@@ -471,6 +508,9 @@ func BuildCompleteSurgeConfig(
 	ruleBuilder.WriteString("[Rule]")
 	for _, rule := range surgeRules {
 		ruleBuilder.WriteString("\n")
+		if err := validateRulePolicy(rule, pruned.Dangling); err != nil {
+			return "", err
+		}
 		ruleBuilder.WriteString(rule)
 	}
 	sections = append(sections, ruleBuilder.String())

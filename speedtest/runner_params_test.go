@@ -9,8 +9,7 @@ import (
 
 // clampSpeedTestParams 是家用测速端的 OOM 闸门:峰值内存约等于
 // BufSize × Threads × downloadBuffersPerThread，而 BufSize/Threads 都由主控在任务里下发。
-// 倍率那一项是后补的:每条流除了 io.CopyBuffer 的 buffer，还各带一份同样大的
-// http.Transport ReadBufferSize，原来只算一份,实际峰值是闸门的两倍。
+// 删除无效拷贝缓冲后继续保留二倍的保守预算，不能无意中放宽主控可请求的内存。
 func TestClampSpeedTestParams归一到文档中的默认值(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -87,10 +86,10 @@ func TestSortInt64Asc(t *testing.T) {
 // 调整任何一个阶段超时都必须让这个用例重新过一遍。
 func TestRun执行预算能装下所有阶段超时(t *testing.T) {
 	// 下载测速最慢路径:sing-box check → 内核就绪 → 出口 IP → 延迟 → 下载准备 → 吞吐窗口。
-	download := singBoxCheckTimeout + coreReadyTimeout + egressProbeTimeout +
+	download := kernelPrepareTimeout + singBoxCheckTimeout + coreReadyTimeout + egressProbeTimeout +
 		latencyProbeTimeout + downloadSetupTime + defaultTestDuration
 	// LatencyOnly 最慢路径:少了下载两段，多了整段 Cloudflare 采样。
-	latencyOnly := singBoxCheckTimeout + coreReadyTimeout + egressProbeTimeout + cfLatencyTotalTimeout
+	latencyOnly := kernelPrepareTimeout + singBoxCheckTimeout + coreReadyTimeout + egressProbeTimeout + cfLatencyTotalTimeout
 
 	for name, phases := range map[string]time.Duration{"下载测速": download, "仅测延迟": latencyOnly} {
 		if phases > runExecutionBudget {

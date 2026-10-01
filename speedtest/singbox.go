@@ -11,7 +11,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -23,7 +22,7 @@ const (
 )
 
 var (
-	singBoxMu         sync.Mutex
+	singBoxMu         = newKernelMutex()
 	singBoxCachedPath string
 	singBoxVerRe      = regexp.MustCompile(`v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)`)
 )
@@ -37,10 +36,15 @@ func singBoxBinName() string {
 }
 
 // singBoxVersion 运行版本命令并提取完整语义版本，保留 alpha、beta 或 rc 后缀。
-func singBoxVersion(bin string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+func singBoxVersion(parent context.Context, bin string) string {
+	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
 	defer cancel()
-	out, _ := exec.CommandContext(ctx, bin, "version").CombinedOutput()
+	cmd := exec.CommandContext(ctx, bin, "version")
+	cmd.WaitDelay = coreKillWaitLimit
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return ""
+	}
 	matched := singBoxVerRe.FindStringSubmatch(string(out))
 	if matched == nil {
 		return ""
@@ -49,8 +53,8 @@ func singBoxVersion(bin string) string {
 }
 
 // singBoxSupported 保留已验证的兼容下限，镜像升级正式版不强制用户替换显式指定的合格内核。
-func singBoxSupported(bin string) bool {
-	version := singBoxVersion(bin)
+func singBoxSupported(ctx context.Context, bin string) bool {
+	version := singBoxVersion(ctx, bin)
 	return version != "" && semanticVersionGTE(version, minSingBoxVersion)
 }
 
@@ -177,15 +181,20 @@ func singBoxCandidatePaths() []string {
 // EnsureSingBox 定位 Snell v6 专用内核；Docker 镜像内已固定版本，不在运行时下载内核。
 // 显式 SING_BOX_BIN 与 MIHOMO_BIN 一样采用失败关闭：候选里的 $MMWX_DATA_DIR/bin 是用户可写的
 // 数据卷，静默回退等于允许卷里的文件顶掉镜像自带的内核，而调用方只会看到一次普通的测速失败。
-func EnsureSingBox(_ context.Context) (string, error) {
-	singBoxMu.Lock()
+func EnsureSingBox(ctx context.Context) (string, error) {
+	if err := singBoxMu.LockContext(ctx); err != nil {
+		return "", err
+	}
 	defer singBoxMu.Unlock()
 
 	if explicit := strings.TrimSpace(os.Getenv("SING_BOX_BIN")); explicit != "" {
 		if !fileExists(explicit) {
 			return "", fmt.Errorf("SING_BOX_BIN 指向的 sing-box 不存在: %s", explicit)
 		}
-		if !singBoxSupported(explicit) {
+		if !singBoxSupported(ctx, explicit) {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
 			return "", fmt.Errorf("SING_BOX_BIN 指向的 sing-box 不可执行或版本低于 %s: %s", minSingBoxVersion, explicit)
 		}
 		singBoxCachedPath = explicit
@@ -194,17 +203,23 @@ func EnsureSingBox(_ context.Context) (string, error) {
 	// 数据目录和 PATH 都可能在进程运行期间被原位替换。缓存命中时必须重新执行版本校验，
 	// 否则已降级、损坏或失去执行权限的文件会持续污染后续所有 Snell v6 任务。
 	if singBoxCachedPath != "" {
-		if fileExists(singBoxCachedPath) && singBoxSupported(singBoxCachedPath) {
+		if fileExists(singBoxCachedPath) && singBoxSupported(ctx, singBoxCachedPath) {
 			return singBoxCachedPath, nil
 		}
 		singBoxCachedPath = ""
 	}
 	for _, candidate := range singBoxCandidatePaths() {
-		if !fileExists(candidate) || !singBoxSupported(candidate) {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		if !fileExists(candidate) || !singBoxSupported(ctx, candidate) {
 			continue
 		}
 		singBoxCachedPath = candidate
 		return candidate, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	return "", fmt.Errorf("未找到 sing-box %s+；请使用双内核镜像或设置 SING_BOX_BIN", minSingBoxVersion)
 }
