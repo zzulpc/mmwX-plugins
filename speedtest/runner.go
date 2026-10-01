@@ -23,7 +23,6 @@ import (
 const (
 	defaultTestURL      = "https://dl.google.com/dl/android/studio/install/3.4.1.0/android-studio-ide-183.5522156-windows.exe"
 	defaultTestDuration = 8 * time.Second
-	latencyProbeURL     = "https://www.gstatic.com/generate_204"
 	cfLatencyProbeURL   = "https://cp.cloudflare.com/generate_204" // 真延迟用 Cloudflare 204(全球边缘 + CDN 边)
 	egressIPProbeURL    = "https://api.ipify.org"                  // 经代理回显出口 IP,用于核对出站链路是否符合预期
 	cfLatencySamples    = 3                                        // 真延迟采样次数,取最快 2 个均值(去掉首包冷启动)
@@ -38,9 +37,8 @@ const (
 // TestRun执行预算能装下所有阶段超时 把这笔加法钉死:改任何一个阶段超时都必须同步过它。
 const (
 	egressProbeTimeout     = 5 * time.Second  // 出口 IP 回显
-	latencyProbeTimeout    = 5 * time.Second  // 普通 204 延迟探测
-	cfLatencySampleTimeout = 4 * time.Second  // LatencyOnly 单次采样
-	cfLatencyTotalTimeout  = 12 * time.Second // LatencyOnly 整个采样阶段(3 次采样共用)
+	cfLatencySampleTimeout = 4 * time.Second  // 两种测速模式共用的单次采样
+	cfLatencyTotalTimeout  = 12 * time.Second // 整个采样阶段(3 次采样共用)
 	downloadSetupTime      = 10 * time.Second // 首个 2xx 的独立准备预算,不挤占吞吐窗口
 	runPhaseMargin         = 5 * time.Second  // 进程启停、临时目录、调度等零碎开销
 
@@ -48,7 +46,7 @@ const (
 	// 的 runQueueWaitBudget。两者以前混在一起,4 个在途任务共用同一个 38s 时钟,
 	// 排在后面的任务会被前面的执行时间吃光预算。
 	runExecutionBudget = kernelPrepareTimeout + coreReadyTimeout + singBoxCheckTimeout + egressProbeTimeout +
-		latencyProbeTimeout + downloadSetupTime + defaultTestDuration + runPhaseMargin
+		cfLatencyTotalTimeout + downloadSetupTime + defaultTestDuration + runPhaseMargin
 )
 
 // runExecutionSlot 串行化测速，同时允许排队任务因超时或断线立即退出。
@@ -222,9 +220,10 @@ func runNodeTest(ctx context.Context, runtimeInfo proxyRuntime, clashConfigJSON 
 
 	egressIP := measureEgressIP(ctx, mixedPort)
 
-	// LatencyOnly:只测真连接延迟(Cloudflare 204 多采样),不跑下载
+	// 两种模式在分支之前共用端点与采样方式，避免完整测速混入另一种延迟口径。
+	// 必须先测延迟再下载，否则带宽占满时的排队时间会被误当成节点延迟。
+	latency := measureLatencyCloudflare(ctx, mixedPort, cfLatencySamples)
 	if opts.LatencyOnly {
-		latency := measureLatencyCloudflare(ctx, mixedPort, cfLatencySamples)
 		result := Result{LatencyMs: latency, EgressIP: egressIP}
 		// 没有有效样本或任务已经取消时必须回报失败，否则主控会把 -1 毫秒当成成功结果。
 		if err := ctx.Err(); err != nil {
@@ -235,8 +234,6 @@ func runNodeTest(ctx context.Context, runtimeInfo proxyRuntime, clashConfigJSON 
 		}
 		return result, nil
 	}
-
-	latency := measureLatency(ctx, mixedPort)
 
 	bufSize, threads := clampSpeedTestParams(opts.BufSize, opts.Threads)
 	n, dur, err := downloadTimed(ctx, testURL, opts.TestDuration, opts.TestBytes, threads, bufSize, mixedPort)
@@ -360,15 +357,6 @@ func proxyClientBuf(mixedPort, bufSize int) *http.Client {
 	return &http.Client{Transport: newProxyTransport(mixedPort, bufSize)}
 }
 
-// measureLatency 经代理 GET 一个 204 端点,返回毫秒;失败返回 -1。
-//
-// 固定端点只认 204；登录页或错误页即使返回 200，也不能作为有效延迟。
-func measureLatency(ctx context.Context, mixedPort int) int64 {
-	client := latencyProbeClient(mixedPort, latencyProbeTimeout)
-	defer client.CloseIdleConnections()
-	return measureLatencySample(ctx, client, latencyProbeURL)
-}
-
 // 固定探测端点不应跳转；跟随登录页后再收到 204 也不能证明原端点正常。
 func latencyProbeClient(mixedPort int, timeout time.Duration) *http.Client {
 	client := proxyClient(mixedPort)
@@ -403,8 +391,8 @@ func measureLatencySample(ctx context.Context, client *http.Client, probeURL str
 // measureLatencyCloudflare 用 Cloudflare 204 多次采样,取最快 2 个均值;
 // 首包受 TLS 握手 / mihomo cold-start 影响,平均后更接近"真连接延迟"。全部失败返回 -1。
 //
-// 整个采样阶段另有 cfLatencyTotalTimeout 兜底:单次超时 × 采样数会突破 runExecutionBudget
-// 里为这一阶段留的份额,而 LatencyOnly 任务后面还要靠这个预算收尾。
+// 整个采样阶段另有 cfLatencyTotalTimeout 兜底，必须装进 runExecutionBudget，
+// 给完整测速后面的下载准备与吞吐窗口留足执行时间。
 // 非 204 的样本直接丢弃，一个都没有就返回 -1，由调用方回报失败。
 func measureLatencyCloudflare(ctx context.Context, mixedPort, samples int) int64 {
 	if samples <= 0 {

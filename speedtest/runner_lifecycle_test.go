@@ -74,15 +74,23 @@ func TestLifecycleFakeCoreProcess(t *testing.T) {
 	if err := yaml.Unmarshal(config, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		response, err := http.Get(controlURL)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, controlURL, nil)
+		if err != nil {
+			http.Error(w, "本地控制请求无效", http.StatusBadGateway)
+			return
+		}
+		// 让父测试观察两个入口实际访问的端点和先后顺序，不依赖源码匹配来判断口径。
+		request.Header.Set("X-Test-Proxy-Target", r.Host)
+		request.Header.Set("X-Test-Proxy-Method", r.Method)
+		response, err := http.DefaultClient.Do(request)
 		if err != nil {
 			http.Error(w, "本地控制端不可用", http.StatusBadGateway)
 			return
 		}
-		io.Copy(io.Discard, response.Body)
-		response.Body.Close()
-		http.Error(w, "本地假代理拒绝连接", http.StatusBadGateway)
+		defer response.Body.Close()
+		w.WriteHeader(response.StatusCode)
+		io.Copy(w, response.Body)
 	})
 	if err := http.ListenAndServe(fmt.Sprintf("127.0.0.1:%d", decoded.MixedPort), handler); err != nil {
 		t.Fatal(err)

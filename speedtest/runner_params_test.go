@@ -87,8 +87,8 @@ func TestSortInt64Asc(t *testing.T) {
 func TestRun执行预算能装下所有阶段超时(t *testing.T) {
 	// 下载测速最慢路径:sing-box check → 内核就绪 → 出口 IP → 延迟 → 下载准备 → 吞吐窗口。
 	download := kernelPrepareTimeout + singBoxCheckTimeout + coreReadyTimeout + egressProbeTimeout +
-		latencyProbeTimeout + downloadSetupTime + defaultTestDuration
-	// LatencyOnly 最慢路径:少了下载两段，多了整段 Cloudflare 采样。
+		cfLatencyTotalTimeout + downloadSetupTime + defaultTestDuration
+	// LatencyOnly 最慢路径:共用延迟采样，少了下载两段。
 	latencyOnly := kernelPrepareTimeout + singBoxCheckTimeout + coreReadyTimeout + egressProbeTimeout + cfLatencyTotalTimeout
 
 	for name, phases := range map[string]time.Duration{"下载测速": download, "仅测延迟": latencyOnly} {

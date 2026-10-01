@@ -122,6 +122,12 @@ type wsMsg struct {
 	Targets   []string      `json:"targets,omitempty"` // master→tester:待拨测的 host:port 列表
 	TimeoutMS int           `json:"timeout_ms,omitempty"`
 	Results   []probeResult `json:"results,omitempty"` // tester→master
+
+	// 订阅内容可能不是 UTF-8；沿用主控的 base64 回包协议，避免编码时损坏原始字节。
+	UserAgent  string            `json:"user_agent,omitempty"`
+	StatusCode int               `json:"status_code,omitempty"`
+	Headers    map[string]string `json:"headers,omitempty"`
+	Body       string            `json:"body,omitempty"`
 }
 
 // probeResult 单个目标的拨测结果。
@@ -281,7 +287,7 @@ func connectAndServeWithIPv6Check(wsURL, name string, onConnected func(), ipv6Ch
 	// 否则给老测速端派 probe 会被静默丢弃,主控只能干等超时。
 	// probe6:本机能拨通公网 IPv6 才声明 —— 否则主控会把 v6 节点(都是外网 v6 地址)误报被墙
 	//(此测速端对所有 v6 目标都 network unreachable)。有 probe6 的源才被主控派去探 v6 节点。
-	caps := []string{"speedtest", "probe"}
+	caps := []string{"speedtest", "probe", "fetch"}
 	if ipv6Check != nil && ipv6Check() {
 		caps = append(caps, "probe6")
 	}
@@ -325,6 +331,8 @@ func connectAndServeWithIPv6Check(wsURL, name string, onConnected func(), ipv6Ch
 			dispatchRunJob(connectionCtx, msg, send)
 		case "probe":
 			dispatchProbeJob(connectionCtx, msg, send)
+		case "fetch":
+			dispatchFetchJob(connectionCtx, msg, send)
 		}
 		// pong 等忽略
 	}
@@ -705,7 +713,12 @@ func connectionSender(connectionCtx context.Context, cancelConnection context.Ca
 			return connectionCtx.Err()
 		default:
 		}
-		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		writeTimeout := 10 * time.Second
+		if m.Type == "fetch_result" && m.Body != "" {
+			// 订阅回包经 base64 后可能有数 MiB，家宽上传不应沿用小状态帧的 10 秒上限。
+			writeTimeout = fetchTimeout
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 		data, _ := json.Marshal(m)
 		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
 			// 写失败已经能证明这条连接不可用，立即取消它派发的任务，

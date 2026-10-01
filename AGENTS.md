@@ -44,7 +44,7 @@ cd speedtest && go build ./... && go vet ./... && go test ./... -count=1
 
 基线（2026-10-01，darwin/arm64，Go 1.26.8，与发布工具链一致）：两者都干净通过，`go vet` 无告警。
 覆盖率（`go test ./... -cover -count=1`）：`proxyparser` 67.9%、
-`proxyparser/internal/valueutil` 74.2%、`proxyparser/substore` 54.6%、`speedtest` 70.8%
+`proxyparser/internal/valueutil` 74.2%、`proxyparser/substore` 54.6%、`speedtest` 72.8%
 （parser 仍有 4 个既有跳过用例；本机跳过 Windows 安装测试和 2 个可选的已安装
 sing-box 校验；启用这些用例时应单独记录覆盖率）。
 请在同一 Go 工具链下比较覆盖率，不要直接与旧 Go 1.27.0 基线混用；跨包往返测试
